@@ -22,7 +22,7 @@ import struct
 import time
 
 from dbus_fast.aio import MessageBus
-from dbus_fast import BusType, Message, MessageType
+from dbus_fast import BusType, Message, MessageType, Variant
 
 log = logging.getLogger("huion-ble")
 
@@ -228,7 +228,7 @@ class BLEConnection:
     def __init__(self, mac: str):
         self.mac = mac
         self.device_path = f"{ADAPTER_PATH}/dev_{mac.replace(':', '_')}"
-        self._notify_fd_alive = False  # set True when fd reader is active
+        # _write_fd used by write_cmd for raw fd writes (if AcquireWrite succeeded)
         self.ffe1_path = f"{self.device_path}/service0025/char0026"
         self.ffe2_path = f"{self.device_path}/service0025/char002a"
         self.bus: MessageBus | None = None
@@ -255,10 +255,13 @@ class BLEConnection:
         return await self._get_prop(self.device_path, "org.bluez.Device1", "Connected") is True
 
     async def disconnect(self):
-        await self.bus.call(Message(
-            destination=BLUEZ, path=self.device_path,
-            interface="org.bluez.Device1", member="Disconnect",
-        ))
+        try:
+            await asyncio.wait_for(self.bus.call(Message(
+                destination=BLUEZ, path=self.device_path,
+                interface="org.bluez.Device1", member="Disconnect",
+            )), timeout=3.0)
+        except (asyncio.TimeoutError, Exception) as e:
+            log.warning("Disconnect call: %s", e)
         for _ in range(20):
             if not await self.is_connected():
                 return
@@ -267,11 +270,16 @@ class BLEConnection:
     async def _services_resolved(self) -> bool:
         return await self._get_prop(self.device_path, "org.bluez.Device1", "ServicesResolved") is True
 
-    async def force_reconnect(self) -> bool:
-        """Disconnect, reconnect, wait for GATT services to resolve."""
-        log.info("Reconnecting to %s...", self.mac)
-        await self.disconnect()
-        await asyncio.sleep(0.3)
+    async def connect(self) -> bool:
+        """Establish a BLE connection with resolved GATT services.
+        Reuses existing connection if available — never forces disconnect
+        (device in idle mode ignores disconnect, corrupting BlueZ state).
+        """
+        if await self.is_connected() and await self._services_resolved():
+            log.info("Connected to %s, GATT services resolved", self.mac)
+            return True
+
+        log.info("Connecting to %s...", self.mac)
         reply = await self.bus.call(Message(
             destination=BLUEZ, path=self.device_path,
             interface="org.bluez.Device1", member="Connect",
@@ -279,24 +287,19 @@ class BLEConnection:
         if reply.message_type == MessageType.ERROR:
             err = reply.error_name or ""
             if "AlreadyConnected" not in err:
-                log.error("Connect failed: %s", err)
-                return False
-        # Wait for connection
-        for _ in range(30):
-            if await self.is_connected():
-                break
+                if not await self.is_connected():
+                    log.error("Connect failed: %s", err)
+                    return False
+        # Wait for connection + service resolution
+        for _ in range(80):  # up to 8s
+            if await self.is_connected() and await self._services_resolved():
+                log.info("Connected, GATT services resolved")
+                return True
             await asyncio.sleep(0.1)
         if not await self.is_connected():
             log.error("Connection failed — is the tablet awake?")
-            return False
-        log.info("Connected, waiting for GATT service resolution...")
-        # Wait for ServicesResolved — GATT paths don't exist until this is true
-        for _ in range(50):
-            if await self._services_resolved():
-                log.info("GATT services resolved")
-                return True
-            await asyncio.sleep(0.1)
-        log.error("Timed out waiting for GATT services to resolve")
+        else:
+            log.error("Connected but GATT services not resolved")
         return False
 
     def _close_fds(self):
@@ -309,30 +312,38 @@ class BLEConnection:
             self._write_fd = None
 
     async def write_cmd(self, data: bytes) -> bool:
-        """Write command via raw fd if acquired, otherwise D-Bus WriteValue."""
+        """Write command via raw fd if acquired, otherwise D-Bus WriteValue.
+        Uses WriteWithoutResponse (type=command) matching the official driver."""
         if self._write_fd is not None:
             try:
                 os.write(self._write_fd, data)
                 return True
-            except OSError:
+            except OSError as e:
+                log.debug("fd write failed: %s", e)
                 return False
         reply = await self.bus.call(Message(
             destination=BLUEZ, path=self.ffe2_path,
             interface="org.bluez.GattCharacteristic1",
             member="WriteValue", signature="aya{sv}",
-            body=[bytearray(data), {}],
+            body=[bytearray(data), {"type": Variant("s", "command")}],
         ))
-        return reply.message_type != MessageType.ERROR
+        if reply.message_type == MessageType.ERROR:
+            log.debug("WriteValue failed: %s", reply.error_name)
+            return False
+        return True
 
     async def acquire_fds(self) -> tuple[int | None, int | None]:
-        """Acquire raw fds for FFE1 (notify) and FFE2 (write).
-        Bypasses BlueZ's GATT layer entirely — required because StartNotify
-        silently fails when the HOGP handler claims the device.
-        Returns (notify_fd, write_fd)."""
+        """Acquire raw fds for FFE1 (notify) and FFE2 (write), and enable
+        indications on FFE2 via StartNotify.
+
+        No delay — acquire immediately after ServicesResolved. HOGP may kill
+        the fds after ~1s, but the retry loop handles that. After HOGP
+        settles, fds acquired on a fresh connection are stable.
+        """
         notify_fd = None
         write_fd = None
 
-        # Acquire notification fd for FFE1
+        # AcquireNotify on FFE1 — raw fd for pen data
         reply = await self.bus.call(Message(
             destination=BLUEZ, path=self.ffe1_path,
             interface="org.bluez.GattCharacteristic1",
@@ -343,18 +354,31 @@ class BLEConnection:
         if reply.message_type == MessageType.ERROR:
             log.warning("AcquireNotify FFE1 failed: %s", reply.error_name)
         else:
-            # body[0] is the fd INDEX, actual fd is in unix_fds
             fd_idx = reply.body[0]
             mtu = reply.body[1]
             fds = getattr(reply, 'unix_fds', None)
             if fds and len(fds) > fd_idx:
                 notify_fd = fds[fd_idx]
             else:
-                notify_fd = fd_idx  # fallback if fds not available
-            log.info("AcquireNotify FFE1: fd=%d (idx=%d, fds=%s), MTU=%d",
-                     notify_fd, fd_idx, fds, mtu)
+                notify_fd = fd_idx
+            log.info("AcquireNotify FFE1: fd=%d, MTU=%d", notify_fd, mtu)
 
-        # Acquire write fd for FFE2
+        # StartNotify on FFE2 — enable indications (CCCD write for device
+        # mode detection, matching macOS driver's setNotifyValue:1 on both)
+        reply = await self.bus.call(Message(
+            destination=BLUEZ, path=self.ffe2_path,
+            interface="org.bluez.GattCharacteristic1",
+            member="StartNotify",
+        ))
+        if reply.message_type == MessageType.ERROR:
+            err = reply.error_name or ""
+            if "InProgress" not in err:
+                log.warning("StartNotify FFE2 failed: %s", err)
+        else:
+            log.info("StartNotify FFE2: indications enabled")
+
+        # AcquireWrite on FFE2 — raw fd for commands
+        self._close_fds()
         reply = await self.bus.call(Message(
             destination=BLUEZ, path=self.ffe2_path,
             interface="org.bluez.GattCharacteristic1",
@@ -397,10 +421,7 @@ class BLEConnection:
         elif msg.path == self.device_path and "Connected" in changed:
             if not changed["Connected"].value:
                 log.warning("Device disconnected (D-Bus signal)")
-                # Don't trigger reconnect from D-Bus signal alone — the notify fd
-                # reader is the authority. HOGP can cause transient Connected=false
-                # while our acquired fd is still alive and streaming data.
-                if self._disconnect_cb and not self._notify_fd_alive:
+                if self._disconnect_cb:
                     self._disconnect_cb()
 
     async def setup_signals(self, on_notification, on_disconnect):
@@ -421,7 +442,11 @@ class BLEConnection:
         ))
 
     async def close(self):
+        """Release GATT resources before closing the D-Bus connection.
+        Keep FFE2 StartNotify alive — the indication session helps the
+        device stay in pen tablet mode across reconnects."""
         if self.bus:
+            self._close_fds()
             self.bus.disconnect()
 
 
@@ -462,7 +487,7 @@ class HuionBLEDriver:
         self.device_name = "unknown"
         self._running = True
         self._disconnect_event = asyncio.Event()
-        self._notify_fd: int | None = None
+        # Pen data arrives via D-Bus PropertiesChanged signals (no raw fd)
         self._pen_was_active = False
         self._handshake_responses: dict[int, bytes] = {}
         self._stats = {"samples": 0, "reconnects": 0}
@@ -517,26 +542,23 @@ class HuionBLEDriver:
 
     # ── Connection + handshake ──
 
-    async def _send_handshake_cmds(self, write_fd: int, cmds: list[bytes], label: str) -> bool:
-        """Send a list of handshake commands via the write fd."""
-        log.info("Sending %s handshake via fd...", label)
-        for i, cmd in enumerate(cmds):
-            try:
-                os.write(write_fd, cmd)
-                log.debug("  %s cmd %d: %s", label, i + 1, cmd.hex())
-                await asyncio.sleep(0.15)
-            except OSError as e:
-                log.warning("%s handshake cmd %d write failed: %s", label, i + 1, e)
+    async def _send_handshake(self) -> bool:
+        """Send handshake commands via D-Bus WriteValue."""
+        log.info("Sending handshake...")
+        for i, cmd in enumerate(TABLET_HANDSHAKE):
+            if not await self.ble.write_cmd(cmd):
+                log.warning("Handshake cmd %d write failed", i + 1)
                 return False
+            log.debug("  cmd %d: %s", i + 1, cmd.hex())
+            await asyncio.sleep(0.15)
         return True
 
     async def _connect_and_handshake(self) -> bool:
-        """Connect, wait for GATT services, acquire fds, then send handshake."""
-        # Clean up fds from previous session
+        """Connect, acquire fds, send handshake."""
         self.ble._close_fds()
         self._notify_fd = None
 
-        if not await self.ble.force_reconnect():
+        if not await self.ble.connect():
             return False
         self._disconnect_event.clear()
 
@@ -547,17 +569,11 @@ class HuionBLEDriver:
             log.error("AcquireNotify failed — GATT characteristics not available")
             return False
 
-        # Unbind hid-generic as a safety net (UserspaceHID=true should prevent
-        # HOGP from claiming, but unbind if it somehow does)
         _unbind_hid_generic()
 
-        await self._send_handshake_cmds(write_fd, TABLET_HANDSHAKE, "tablet")
+        if not await self._send_handshake():
+            return False
         log.info("Handshake complete")
-
-        # Schedule repeated unbinds to catch late HID device creation
-        asyncio.get_event_loop().call_later(1.0, _unbind_hid_generic)
-        asyncio.get_event_loop().call_later(2.5, _unbind_hid_generic)
-        asyncio.get_event_loop().call_later(5.0, _unbind_hid_generic)
         return True
 
     # ── Notification fd reader ──
@@ -570,7 +586,6 @@ class HuionBLEDriver:
         loop = asyncio.get_event_loop()
         log.info("Reading notifications from fd %d", fd)
 
-        # Use add_reader for proper non-blocking I/O
         data_queue: asyncio.Queue[bytes] = asyncio.Queue()
 
         def _on_readable():
@@ -578,31 +593,28 @@ class HuionBLEDriver:
                 data = os.read(fd, 512)
                 if data:
                     data_queue.put_nowait(data)
+                else:
+                    data_queue.put_nowait(b"")  # EOF — device disconnected
             except BlockingIOError:
-                pass  # EAGAIN — no data right now
+                pass
             except OSError:
-                data_queue.put_nowait(b"")  # signal EOF
+                data_queue.put_nowait(b"")
 
         loop.add_reader(fd, _on_readable)
-        self.ble._notify_fd_alive = True
         try:
             while self._running:
                 try:
-                    data = await asyncio.wait_for(data_queue.get(), timeout=4.0)
+                    data = await asyncio.wait_for(data_queue.get(), timeout=30.0)
                 except asyncio.TimeoutError:
-                    # No data for 4s — HOGP likely killed the notification stream
-                    log.warning("Data stall (4s no data) — triggering reconnect")
-                    self.ble._notify_fd_alive = False
+                    log.warning("Data stall (30s no data) — triggering reconnect")
                     self._disconnect_event.set()
                     break
                 if not data:
                     log.warning("Notification fd closed — triggering reconnect")
-                    self.ble._notify_fd_alive = False
                     self._disconnect_event.set()
                     break
                 self._on_notification(data)
         finally:
-            self.ble._notify_fd_alive = False
             loop.remove_reader(fd)
             try:
                 os.close(fd)
@@ -614,14 +626,18 @@ class HuionBLEDriver:
     async def _keepalive_loop(self):
         """Send battery query as keepalive. Recreated per session."""
         cmd = build_tablet_cmd(CMD_TABLET_BATTERY)
+        # Skip the first keepalive — let the connection stabilize
+        await asyncio.sleep(KEEPALIVE_INTERVAL)
         while self._running:
-            await self.ble.write_cmd(cmd)
+            ok = await self.ble.write_cmd(cmd)
+            if not ok:
+                log.warning("Keepalive write failed — connection may be dead")
             await asyncio.sleep(KEEPALIVE_INTERVAL)
 
     # ── Session loop (keepalive lifecycle + reconnect) ──
 
     async def _session_loop(self):
-        """Each connection session gets a reader task and keepalive task."""
+        """Reader + keepalive tasks, reconnect on disconnect."""
         while self._running:
             reader_task = asyncio.create_task(self._notify_fd_reader())
             keepalive_task = asyncio.create_task(self._keepalive_loop())
@@ -631,14 +647,11 @@ class HuionBLEDriver:
 
             reader_task.cancel()
             keepalive_task.cancel()
-            try:
-                await reader_task
-            except asyncio.CancelledError:
-                pass
-            try:
-                await keepalive_task
-            except asyncio.CancelledError:
-                pass
+            for task in (reader_task, keepalive_task):
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
             if not self._running:
                 break
@@ -648,7 +661,6 @@ class HuionBLEDriver:
                 self._pen_was_active = False
 
             self._stats["reconnects"] += 1
-            backoff = 1.0
             while self._running:
                 self._disconnect_event.clear()
                 try:
@@ -657,9 +669,15 @@ class HuionBLEDriver:
                         break
                 except Exception as e:
                     log.warning("Reconnect error: %s", e)
-                log.info("Retry in %.1fs...", backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
+                # AcquireNotify fails on stale GATT state — wait for a
+                # device-initiated disconnect to get a fresh GATT client.
+                # Device disconnects every ~3-5s on its own.
+                try:
+                    await asyncio.wait_for(
+                        self._disconnect_event.wait(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    pass
+                await asyncio.sleep(0.5)
 
     # ── Main entry ──
 
@@ -671,7 +689,20 @@ class HuionBLEDriver:
         await self.ble.connect_bus()
         await self.ble.setup_signals(self._on_notification, self._on_disconnect)
 
-        if not await self._connect_and_handshake():
+        for attempt in range(10):
+            if await self._connect_and_handshake():
+                break
+            # AcquireNotify fails on stale connections. Wait for the device
+            # to disconnect (e.g. cover close) which gives us a fresh link.
+            log.info("Waiting for fresh BLE connection (close/open tablet cover)...")
+            self._disconnect_event.clear()
+            try:
+                await asyncio.wait_for(self._disconnect_event.wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                pass
+            # Small delay for BlueZ to process the reconnect
+            await asyncio.sleep(1.0)
+        else:
             log.error("Initial connection failed. Make sure the tablet is powered on.")
             return
 
@@ -690,12 +721,15 @@ class HuionBLEDriver:
         print(f"  Max X:    {self.max_x}")
         print(f"  Max Y:    {self.max_y}")
         print(f"  Pressure: {self.max_pressure} levels")
-        print(f"\n  Driver active — move the pen! (Ctrl+C to stop)\n")
+        print(f"\n  Driver active — move the pen!")
+        print(f"  If no pen data, close and reopen the tablet cover.\n")
 
         session = asyncio.create_task(self._session_loop())
 
         try:
             last_report = time.monotonic()
+            total_samples = 0
+            idle_warned = False
             while self._running:
                 await asyncio.sleep(5.0)
                 now = time.monotonic()
@@ -703,8 +737,15 @@ class HuionBLEDriver:
                 rate = self._stats["samples"] / elapsed if elapsed > 0 else 0
                 log.info("samples=%d (%.0f/s), reconnects=%d",
                          self._stats["samples"], rate, self._stats["reconnects"])
+                total_samples += self._stats["samples"]
                 self._stats["samples"] = 0
                 last_report = now
+                if total_samples == 0 and not idle_warned and now - last_report > -1:
+                    # Check after ~10s of running
+                    if (now - last_report + elapsed) > 9:
+                        log.warning("No pen data yet — close and reopen the tablet "
+                                    "cover to activate pen tablet mode")
+                        idle_warned = True
         except asyncio.CancelledError:
             pass
         finally:

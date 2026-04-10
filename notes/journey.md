@@ -1077,3 +1077,419 @@ Mapping to screen coordinates is left to libinput / the compositor.
 | uinput virtual tablet | **WORKING** | ABS_X/Y/PRESSURE/TILT_X/TILT_Y, cursor moves |
 | Connection stability | **STABLE** | 0 reconnects over 30s, stall timeout as safety net |
 | Data stall detection | Working | 4s timeout triggers reconnect if HOGP wins the race |
+
+---
+
+## 2026-04-10: Connection Stability Deep Dive — HOGP Root Cause Confirmed
+
+### Context
+
+After the initial pen data breakthrough, the driver worked in controlled tests but
+was unreliable in practice — the AcquireNotify fd died every ~1-5 seconds, and
+reconnects were slow/broken. This session was a systematic investigation of the
+connection instability.
+
+### Key Discovery 1: StartNotify FFE2 (CCCD Indication Enable)
+
+**Root cause of "device stays in idle mode":** The macOS driver's
+`didDiscoverCharacteristicsForService:` calls `setNotifyValue:YES` on **both**
+FFE1 AND FFE2 (line 4217 in libTabletSession_dylib_ble_functions.c). Our Linux
+driver only called `AcquireNotify` on FFE1 (which writes the notify CCCD) and
+`AcquireWrite` on FFE2 (which does NOT write the indicate CCCD).
+
+FFE2 has the `indicate` property (CCCD bit 0x0002). Writing this CCCD is what
+signals the device that a proper driver is connected. Without it, the device
+stays in idle mode (green LED) and never sends pen data.
+
+**Fix:** Added `StartNotify` on FFE2 before `AcquireWrite`. This writes the
+indicate CCCD (0x0002) to FFE2, matching the macOS driver behavior. Pen data
+immediately started flowing.
+
+### Key Discovery 2: BlueZ CCCD Behavior (from source code analysis)
+
+Deep analysis of BlueZ 5.84 source confirmed:
+- **CCCD is NOT cached** client-side for bonded devices. Every `StartNotify`
+  writes the CCCD on the wire. (Only the GATT DB structure is cached.)
+- **`StopNotify` + `StartNotify`** forces a fresh CCCD write (0x0000 then
+  0x0001/0x0002). But calling `StopNotify` on FFE1 triggers a device disconnect
+  because the device interprets CCCD=0x0000 as "stop sending data."
+- **`AcquireNotify` fd doesn't survive disconnect** — must re-acquire after
+  each reconnect. `StartNotify` sessions DO survive (auto-re-registered).
+- **`AcquireNotify` and `StartNotify` are mutually exclusive** per characteristic.
+- **`UserspaceHID=true` does NOT disable HOGP.** It only affects classic
+  Bluetooth HID. The HOG plugin runs regardless of this setting.
+
+### Key Discovery 3: HOGP Is BlueZ-Initiated Disconnect
+
+btmon capture proved the disconnect is **host-initiated**, not device-initiated:
+
+```
+< HCI Command: Disconnect (0x01|0x0006) plen 3    #719 [hci0] 7.997665
+        Handle: 16 Address: 20:23:11:01:CD:27
+        Reason: Remote User Terminated Connection (0x13)
+```
+
+The `<` prefix means **outgoing from host**. BlueZ is sending the HCI Disconnect
+command. The "Remote User Terminated" is just the reason code BlueZ puts in the
+request — it does NOT mean the device initiated it.
+
+**Pattern from btmon:** Disconnects at 3.7s, 8.0s, 12.2s — intervals of ~4s.
+
+**Before the first disconnect:** The device sent 3 duplicate `Exchange MTU
+Request` packets. BlueZ may interpret this as a protocol violation.
+
+**Before subsequent disconnects:** Normal pen data flowing on FFE1. BlueZ sends
+Disconnect in the middle of data reception.
+
+### Key Discovery 4: HOGP ATT Operations Cause the Disconnect
+
+After each reconnect, btmon shows BlueZ (HOGP) immediately sends:
+- Multiple `ATT: Read Request` (reading HID characteristics: Report Map, HID Info, etc.)
+- `ATT: Write Request` (writing HID Report CCCD)
+- `ATT: Read By Group Type Request` (service discovery)
+
+These concurrent ATT operations from HOGP's GAttrib API conflict with
+`bt_gatt_client`'s internal operations on the same ATT bearer. ATT is a
+sequential request-response protocol. Two subsystems sending requests
+concurrently causes protocol confusion, which leads to `bt_gatt_client`
+failing, which triggers `gatt_db_service_destroy` → `characteristic_free`
+→ `sock_io_destroy` → fd EOF.
+
+### Key Discovery 5: Deep RE of macOS Driver Connection Lifecycle
+
+Full analysis of libTabletSession_dylib_ble_functions.c confirmed:
+
+1. **No reconnect at BLE level.** On disconnect, the entire `HnTabletThread` is
+   torn down (`reqQuitPassive`). Reconnection comes from a higher layer.
+
+2. **No notification state confirmation wait.** Commands start immediately after
+   `didDiscoverCharacteristicsForService:`. No `didUpdateNotificationState`
+   handler is implemented.
+
+3. **Write uses `WriteWithoutResponse`** (CBCharacteristicWriteWithoutResponse,
+   type 0). The driver checks FFE2's properties at runtime and picks the
+   appropriate write type.
+
+4. **`openBLE_` doesn't scan.** Uses `retrieveConnectedPeripheralsWithServices:`
+   with FFE0 UUID — only retrieves already-connected peripherals.
+
+5. **The second vendor service (00010203...1912 / 2B12) is completely ignored.**
+
+6. **1-second async command timeout.** If no response within 1s, connection is
+   considered failed.
+
+7. **Command framing confirmed:** `{0xCD, cmd_id, 0, 0, 0, 0, 0, 0}` (8 bytes).
+
+### Connection Issues Encountered & Lessons Learned
+
+| Issue | Root Cause | Lesson |
+|-------|-----------|--------|
+| `AcquireNotify FFE1 failed: Error.Failed` on existing connection | BlueZ still holds stale AcquireNotify session from previous process. D-Bus bus disconnect doesn't immediately release the session | Need device-initiated disconnect for fresh GATT client |
+| `StartNotify FFE2 failed: Error.InProgress` | Previous session's StartNotify still active | StartNotify sessions persist — only need to establish once |
+| Forced BLE disconnect corrupts BlueZ state | Calling D-Bus `Disconnect` on a device in idle mode (green LED) doesn't complete. BlueZ starts disconnect internally but device doesn't ACK. GATT client left in half-torn-down state | **Never force disconnect on idle device** |
+| 3s HOGP delay broke writes | After 3s, HOGP has reset the GATT client. AcquireWrite and WriteValue both fail | Delay doesn't help — need to acquire before HOGP or after full disconnect cycle |
+| `WriteValue` always fails on FFE2 | Needs `type: "command"` option for WriteWithoutResponse. Even with correct type, fails after HOGP resets GATT client | Use AcquireWrite raw fd instead of D-Bus WriteValue |
+| EOF detection bug (`if data:` on `os.read`) | `os.read()` returns `b""` on EOF which is falsy. `if data:` skipped it | Changed to `if data: ... else: queue EOF` |
+
+### The HOGP Problem — Why `--noplugin=hog` Is Needed
+
+The HOG plugin is fundamentally incompatible with our driver because:
+
+1. It sends concurrent ATT operations on the same bearer as `bt_gatt_client`
+2. It causes `bt_gatt_client` to reset, which destroys ALL AcquireNotify/Write fds
+3. It periodically triggers HCI Disconnect commands (~every 4s)
+4. There is no per-device way to disable it — `UserspaceHID=true` doesn't help
+5. The only workaround is `bluetoothd --noplugin=hog` or NixOS equivalent
+
+The HOG plugin provides zero value for the Huion tablet:
+- The HID Report Map only describes a keyboard (Usage 0x06)
+- Pen data flows through the vendor FFE0 service, not HID
+- The HOGP-created kernel HID device is just a useless keyboard
+
+### What Works Now (with HOGP still active)
+
+The driver handles HOGP disruptions through reconnect loops:
+1. Connect → AcquireNotify + StartNotify FFE2 + AcquireWrite (immediately)
+2. Pen data flows for ~1-5s until HOGP kills the fd
+3. Reconnect loop waits for device-initiated disconnect signal (~3-5s)
+4. On fresh connection, acquire fds and pen data resumes
+5. Eventually a connection survives HOGP and is stable
+
+This is functional but fragile. The proper fix is disabling HOGP.
+
+### Next Step: Disable HOGP via NixOS
+
+```nix
+services.bluetooth.settings = {
+  General = {
+    DisablePlugins = "hog";
+  };
+};
+```
+
+This prevents the HOG plugin from loading, eliminating all HOGP-caused
+disconnects and fd deaths. Classic Bluetooth HID (BR/EDR keyboards, mice)
+is unaffected — handled by the separate `input` plugin.
+
+---
+
+## 2026-04-10: The Real Root Cause — Device Firmware MTU Bug
+
+### HOGP Was a Red Herring (Partially)
+
+After disabling HOGP (`DisablePlugins=input` in NixOS — note: the plugin name
+is `input`, not `hog`; BlueZ bundles HOGP inside the `input` plugin), the fd
+STILL died every ~4 seconds. This proved HOGP was NOT the primary cause.
+
+**Key finding from `DisablePlugins` investigation:**
+- `DisablePlugins=hog` does NOT work — there is no standalone `hog` plugin
+- `DisablePlugins=input` disables the combined input plugin (classic HID + HOGP)
+- Even with the plugin disabled, stale CCCD subscriptions from previous sessions
+  persisted in BlueZ's runtime state. Required `bluetoothctl remove` + re-pair
+  to clear them. BlueZ's `bt_gatt_client` auto-restores ALL previous
+  `StartNotify` sessions from `all_notify_clients` on reconnect, regardless
+  of which plugin originally created them.
+
+### btmon Reveals the True Root Cause
+
+With HOGP disabled AND fresh pairing (no stale subscriptions), btmon captured
+the exact sequence that kills the connection:
+
+```
+17.165s  LE Connection Parameter Update (device requests 7.5ms interval)
+17.170s  LE Connection Update Complete (BlueZ accepts)
+18.246s  9× ATT: Exchange MTU Request (device re-sends MTU negotiation!)
+18.257s  ATT: Handle Value Notification (pen data starts)
+...      pen data flows for ~2 seconds
+20.253s  < HCI Command: Disconnect (BlueZ disconnects us!)
+```
+
+**The device firmware sends duplicate `Exchange MTU Request` packets after a
+connection parameter update.** The device thinks a new ATT bearer was
+established after the parameter change and re-negotiates MTU. BlueZ's
+`bt_gatt_client` treats duplicate MTU requests as a protocol violation and
+eventually sends HCI Disconnect (~2 seconds after the MTU flood).
+
+### The Full Kill Chain
+
+1. Device connects with default connection parameters
+2. After ~1s, device sends L2CAP Connection Parameter Update Request
+   (requesting 7.5ms interval, 0 latency, 1000ms supervision timeout)
+3. BlueZ accepts the parameters and applies them
+4. Device firmware detects the parameter change and re-sends 9 Exchange MTU
+   Request packets (Client RX MTU: 141) within ~10ms
+5. BlueZ has already completed MTU exchange during initial connect. The duplicate
+   requests confuse `bt_gatt_client`
+6. `bt_gatt_client` resets internally — this destroys all D-Bus characteristic
+   objects, which calls `sock_io_destroy` on AcquireNotify/AcquireWrite fds
+7. Our fds get EOF
+8. ~2s later, BlueZ sends HCI Disconnect
+
+### Why Early Tests Sometimes Worked for 30+ Seconds
+
+In earlier tests (before today's session), the driver sometimes achieved stable
+30-second sessions with 200+ samples/sec and 0 reconnects. The likely explanation:
+the connection parameter update timing was different (perhaps the device didn't
+request an update, or BlueZ rejected it), so the MTU re-negotiation never
+triggered. The behavior appears to depend on BLE connection timing and possibly
+the adapter's state.
+
+### Impact on HOGP Theory
+
+HOGP was a contributing factor but not the root cause:
+- **With HOGP active:** HOGP sends additional ATT operations that compound the
+  MTU bug, making disconnects happen faster and more reliably
+- **With HOGP disabled:** The MTU bug alone causes disconnects, just with
+  slightly different timing
+- **In the "lucky" 30s stable sessions:** Neither HOGP nor the MTU bug triggered
+
+### Possible Fixes
+
+1. **Reject the connection parameter update** — If BlueZ rejects the device's
+   parameter update request, the device won't re-send MTU. Need to investigate
+   if BlueZ has a config option to reject or ignore parameter updates.
+
+2. **Patch BlueZ to tolerate duplicate MTU requests** — Treat re-received
+   Exchange MTU Request as harmless (just re-send the response) instead of
+   resetting the GATT client. This is the "correct" fix per BLE spec tolerance.
+
+3. **Use raw L2CAP/ATT socket** — Bypass BlueZ's `bt_gatt_client` entirely.
+   Open a raw BT_ATT socket and handle GATT operations manually in Python.
+   This gives full control over ATT protocol handling but is a major rewrite.
+
+4. **Pre-set connection parameters** — Use `hcitool` or BlueZ D-Bus to set
+   connection parameters before the device requests them. If the parameters
+   already match what the device wants, it might not trigger an update.
+
+5. **Fast reconnect loop** — Accept the ~4s disconnect as unavoidable and make
+   the reconnect as fast as possible (~500ms). The user would see brief
+   interruptions but the driver would self-heal.
+
+### What Works Now
+
+| Component | Status | Details |
+| --- | --- | --- |
+| BLE connection | Working | Connects, discovers services, acquires fds |
+| StartNotify FFE2 | Working | Enables indicate CCCD — key for mode detection |
+| AcquireNotify FFE1 | Working | Raw fd for pen data, ~50 samples/sec |
+| Pen data parsing | Working | 55 54 format, 14 bytes, 24-bit coords + tilt |
+| Handshake responses | Working | Device name, device info parsed correctly |
+| uinput | Working | Pen cursor moves, pressure + tilt functional |
+| Connection stability | **~4s sessions** | MTU re-negotiation bug causes periodic disconnects |
+| Reconnect loop | Working | Recovers after device-initiated disconnect (~3-5s gap) |
+
+### Systematic Capture Sessions (3 runs)
+
+Ran `capture_session.sh` three times with btmon + driver simultaneously.
+All three sessions show identical pattern:
+
+| Session | Conn Param Updates | MTU Flood Size | fd Lifetime |
+|---------|-------------------|----------------|-------------|
+| #1 (123446) | 1 | 9 requests | ~0s (died immediately) |
+| #2 (123517) | 2 | 9+6 requests | ~2s (died at 2nd update) |
+| #3 (123557) | 2 | 10+8 requests | ~2s (died at 2nd update) |
+
+**Precise timing chain (from btmon timestamps):**
+
+```
+T+0.0s   BLE connect established
+T+1.0s   Device sends L2CAP Connection Parameter Update Request
+         (min/max interval: 6 = 7.5ms, latency: 0, supervision: 100 = 1000ms)
+T+1.0s   BlueZ accepts, applies LE Connection Update
+T+2.0s   Device sends 9-10 Exchange MTU Request (Client RX MTU: 141)
+         (exactly 1.0s after conn param update completes)
+T+2.0s   AcquireNotify fd gets EOF (BlueZ resets bt_gatt_client)
+T+~4s    BlueZ sends HCI Disconnect (or device auto-reconnects)
+```
+
+The device periodically re-requests connection parameters (~7-10s interval).
+Each request triggers the same chain: param update → 1s delay → MTU flood → fd death.
+
+**HOGP was NOT the root cause** — `DisablePlugins=input` didn't fix it.
+Re-enabled HOGP since disabling it provided no benefit for this bug.
+
+**Key insight from stable session comparison:** The earlier stable 30s session
+(btmon capture at 10:04) had 2 conn param updates but zero MTU flood — 
+something about that specific connection prevented the device firmware from
+re-sending MTU. The connection parameters were identical (7.5ms interval).
+The difference may be timing-related (how quickly BlueZ processes the update).
+
+### Next Investigation: Prevent Connection Parameter Updates
+
+The MTU flood only triggers after a connection parameter update. Options:
+
+1. **Pre-set connection parameters** to what the device wants (7.5ms interval)
+   via `hcitool` or BlueZ D-Bus before the device requests an update. If the
+   params already match, the device might skip the L2CAP update request.
+
+2. **Reject the parameter update** — investigate if BlueZ can be configured
+   to reject L2CAP Connection Parameter Update Requests.
+
+3. **Patch BlueZ** to tolerate duplicate Exchange MTU Request by re-sending
+   the MTU Response instead of resetting the GATT client.
+
+4. **Use raw BT_ATT socket** — bypass bt_gatt_client entirely.
+
+---
+
+## 2026-04-10: Resolution — BlueZ 2-Line Patch
+
+### Investigation Results
+
+**LE connection parameters (main.conf `[LE]` section):** Setting `MinConnectionInterval`
+/ `MaxConnectionInterval` to 6 (7.5ms) made BlueZ use the device's preferred parameters
+from the start, but the device firmware **still sends the Connection Parameter Update
+Request regardless of current parameters**. It always re-negotiates after ~1s. Config
+approach ruled out.
+
+**Raw BT_ATT sockets:** Live testing with ctypes-based L2CAP CID 4 sockets confirmed
+they work for ATT operations (MTU exchange, CCCD writes, notifications). However, the
+Linux kernel delivers ALL inbound ATT PDUs to ALL sockets on the same CID — there is
+no way to "claim" exclusive ownership. A raw socket and BlueZ's bt_gatt_client cannot
+coexist on the same connection without data corruption. Ruled out without stopping
+bluetoothd entirely.
+
+### The Fix: BlueZ att.c Patch
+
+The exact crash site in BlueZ 5.84 (`src/shared/att.c` line 1081):
+
+```c
+if (chan->in_req) {
+    DBG(att, "Received request while another is pending: 0x%02x", opcode);
+    io_shutdown(chan->io);     // <-- kills ALL AcquireNotify/AcquireWrite fds
+    bt_att_unref(chan->att);
+    return false;
+}
+```
+
+When the device sends 9 rapid-fire Exchange MTU Requests within ~5ms, the second
+request arrives while `in_req` is still true (first request being processed).
+BlueZ calls `io_shutdown()` which destroys ALL GATT client fds across ALL services.
+
+**The 2-line fix:** Replace `io_shutdown` + `bt_att_unref` + `return false` with
+`return true` (silently drop the duplicate). The duplicate MTU requests are harmless
+— same MTU value, already negotiated. Applied via NixOS package overlay.
+
+### Verification (2 capture sessions)
+
+| Session | Conn Param Updates | MTU Flood | Disconnects | Reconnects | Peak Samples/s |
+|---------|-------------------|-----------|-------------|------------|----------------|
+| #1 | 1 | 9 requests | **0** | **0** | **198/s** |
+| #2 | 0 | 0 | **0** | **0** | **189/s** |
+
+Session 1: Device sent its usual parameter update + 9 MTU requests — patched BlueZ
+dropped the duplicates, zero disconnects, pen data flowed continuously at 139-198/s.
+
+Session 2: Connection parameters already set from session 1, no update needed. Pure
+stable pen data at 189/s with zero interruptions.
+
+### NixOS Integration
+
+```nix
+# In modules/huion-ble.nix
+bluez-patched = pkgs.bluez.overrideAttrs (old: {
+  patches = (old.patches or []) ++ [
+    ./huion/patches/fix-duplicate-mtu-request.patch
+  ];
+});
+# ...
+hardware.bluetooth.package = bluez-patched;
+```
+
+Patch file: `modules/huion/patches/fix-duplicate-mtu-request.patch` (6 lines changed).
+
+### Final Driver Architecture
+
+```
+┌──────────────────┐     ┌───────────────────────┐
+│  BlueZ (patched) │     │  huion_ble_driver.py   │
+│                  │     │                        │
+│  bt_att:         │────▶│  AcquireNotify FFE1    │──▶ pen data fd
+│    drops dup MTU │     │  StartNotify FFE2      │──▶ CCCD indicate
+│                  │     │  AcquireWrite FFE2     │──▶ command write fd
+│  bt_gatt_client: │     │                        │
+│    stays alive   │     │  parse 55 54 packets   │
+│                  │     │  handshake + keepalive  │
+│  HOGP:           │     │                        │
+│    coexists OK   │     └──────────┬─────────────┘
+└──────────────────┘                │ ioctls
+                         ┌──────────▼───────────┐
+                         │  /dev/uinput         │
+                         │  → libinput → app    │
+                         └──────────────────────┘
+```
+
+### What Works
+
+| Component | Status |
+| --- | --- |
+| BLE connection | Stable — no disconnects with patched BlueZ |
+| StartNotify FFE2 | Working — CCCD indicate enables pen tablet mode |
+| AcquireNotify FFE1 | Working — raw fd for pen data, survives MTU flood |
+| AcquireWrite FFE2 | Working — raw fd for commands |
+| Pen data | **198 samples/sec**, 55 54 format, 24-bit coords + tilt |
+| Handshake | Working — device name + info responses parsed |
+| uinput | Working — pen cursor, pressure, tilt all functional |
+| HOGP coexistence | Working — HOGP no longer causes disconnects |
+| Reconnect after cover close | Working — auto-recovers via session loop |
+| BlueZ patch | 2-line change, NixOS overlay, zero maintenance burden |
