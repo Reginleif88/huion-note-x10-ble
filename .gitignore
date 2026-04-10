@@ -1,0 +1,15 @@
+# Proprietary binaries and derived RE output
+Archives/
+
+# Python
+__pycache__/
+*.pyc
+
+# Ghidra
+*.gpr
+*.rep
+*.lock
+
+# Editor
+*.swp
+*~

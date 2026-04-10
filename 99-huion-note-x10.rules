@@ -1,0 +1,20 @@
+# Huion Note X10 BLE tablet — udev rules for userspace driver
+#
+# Install: sudo cp 99-huion-note-x10.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload-rules
+#
+# NixOS:   services.udev.extraRules in configuration.nix (see below)
+
+# Grant user access to /dev/uinput
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input"
+
+# Auto-unbind hid-generic when the Note X10 connects over BLE (bus 0005).
+# Prevents BlueZ HOGP from claiming the device and killing GATT notifications.
+# KERNEL name format is "bus:vendor:product.instance" (e.g. 0005:256C:8251.0001)
+SUBSYSTEM=="hid", KERNEL=="0005:256C:8251.*", RUN+="/bin/sh -c 'echo %k > /sys/bus/hid/drivers/hid-generic/unbind 2>/dev/null || true'"
+
+# NixOS equivalent for configuration.nix:
+#   services.udev.extraRules = ''
+#     KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input"
+#     SUBSYSTEM=="hid", KERNEL=="0005:256C:8251.*", RUN+="/bin/sh -c 'echo %k > /sys/bus/hid/drivers/hid-generic/unbind 2>/dev/null || true'"
+#   '';
