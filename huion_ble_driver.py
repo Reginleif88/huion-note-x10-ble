@@ -264,13 +264,14 @@ class BLEConnection:
                 return
             await asyncio.sleep(0.1)
 
+    async def _services_resolved(self) -> bool:
+        return await self._get_prop(self.device_path, "org.bluez.Device1", "ServicesResolved") is True
+
     async def force_reconnect(self) -> bool:
-        """Disconnect, reconnect, return as fast as possible.
-        Caller should acquire fds IMMEDIATELY after this returns."""
+        """Disconnect, reconnect, wait for GATT services to resolve."""
         log.info("Reconnecting to %s...", self.mac)
         await self.disconnect()
         await asyncio.sleep(0.3)
-        # Connect but DON'T wait for ServicesResolved — we need to race HOGP
         reply = await self.bus.call(Message(
             destination=BLUEZ, path=self.device_path,
             interface="org.bluez.Device1", member="Connect",
@@ -280,16 +281,22 @@ class BLEConnection:
             if "AlreadyConnected" not in err:
                 log.error("Connect failed: %s", err)
                 return False
-        # Minimal wait — just enough for GATT to be reachable, not for full resolution
-        for _ in range(8):
+        # Wait for connection
+        for _ in range(30):
             if await self.is_connected():
-                log.info("Connected (racing HOGP...)")
+                break
+            await asyncio.sleep(0.1)
+        if not await self.is_connected():
+            log.error("Connection failed — is the tablet awake?")
+            return False
+        log.info("Connected, waiting for GATT service resolution...")
+        # Wait for ServicesResolved — GATT paths don't exist until this is true
+        for _ in range(50):
+            if await self._services_resolved():
+                log.info("GATT services resolved")
                 return True
             await asyncio.sleep(0.1)
-        if await self.is_connected():
-            log.info("Connected (late, HOGP may have won)")
-            return True
-        log.error("Connection failed — is the tablet awake?")
+        log.error("Timed out waiting for GATT services to resolve")
         return False
 
     def _close_fds(self):
@@ -524,9 +531,7 @@ class HuionBLEDriver:
         return True
 
     async def _connect_and_handshake(self) -> bool:
-        """Connect, IMMEDIATELY acquire fds (before HOGP handler activates ~1s),
-        unbind hid-generic to prevent HOGP from killing notifications,
-        then send the tablet handshake."""
+        """Connect, wait for GATT services, acquire fds, then send handshake."""
         # Clean up fds from previous session
         self.ble._close_fds()
         self._notify_fd = None
@@ -535,18 +540,15 @@ class HuionBLEDriver:
             return False
         self._disconnect_event.clear()
 
-        # Race the HOGP handler — acquire fds IMMEDIATELY after connect.
-        # HOGP activates ~1-2s after connect and blocks AcquireNotify.
         notify_fd, write_fd = await self.ble.acquire_fds()
         self._notify_fd = notify_fd
 
         if not notify_fd:
-            log.error("AcquireNotify failed — HOGP may have claimed the device")
+            log.error("AcquireNotify failed — GATT characteristics not available")
             return False
 
-        # Unbind hid-generic AFTER acquiring fds — prevents HOGP from killing
-        # the notification stream. Run immediately AND schedule a delayed retry,
-        # because BlueZ may create a new HID device after our first unbind.
+        # Unbind hid-generic as a safety net (UserspaceHID=true should prevent
+        # HOGP from claiming, but unbind if it somehow does)
         _unbind_hid_generic()
 
         await self._send_handshake_cmds(write_fd, TABLET_HANDSHAKE, "tablet")
