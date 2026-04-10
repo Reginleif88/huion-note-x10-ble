@@ -40,8 +40,6 @@ CMD_TABLET_NAME    = 0xC9  # 201 — get device name (UTF-8)
 CMD_TABLET_INFO    = 0xC8  # 200 — get device info (maxX/Y/P, LPI, rate)
 CMD_TABLET_VERIFY  = 0xCA  # 202 — get manufacturer string (verify)
 CMD_TABLET_BATTERY = 0xD1  # 209 — battery query (also used as keepalive)
-REPORT_ID_PEN = 0x08       # USB HID report ID injected by BLE layer
-PEN_TYPE_MAX  = 0x91       # report_type < this = pen data
 
 
 def build_tablet_cmd(cmd_id: int) -> bytes:
@@ -142,9 +140,7 @@ class UInputDevice:
             self.fd = -1
 
 
-# ─── Protocol parsers (from Ghidra RE of macOS v15 driver) ──────────────────
-
-PEN_MAGIC = 0x5554  # BLE pen data header (big-endian: 0x55, 0x54)
+# ─── Protocol parsers ────────────────────────────────────────────────────────
 
 
 def parse_tablet_pen_report(data: bytes) -> tuple | None:
@@ -152,7 +148,7 @@ def parse_tablet_pen_report(data: bytes) -> tuple | None:
 
     Returns (status, x, y, pressure, tilt_x, tilt_y) or None.
 
-    Raw BLE wire format (14 bytes, discovered from live capture):
+    Raw BLE wire format (14 bytes):
       [0-1]  0x55 0x54 — magic header
       [2]    STATUS    — 0x80=hovering, 0x81=touching
       [3-4]  X_lo      — 16-bit LE
@@ -163,39 +159,17 @@ def parse_tablet_pen_report(data: bytes) -> tuple | None:
       [11]   TILT_X    — signed int8
       [12]   TILT_Y    — signed int8
       [13]   CHECKSUM
-
-    The macOS driver skips byte[0], overwrites byte[1] with 0x08, and passes
-    &byte[1] onward — making it look like USB HID report ID 0x08.
     """
-    if len(data) < 13:
+    if len(data) < 13 or data[0] != 0x55 or data[1] != 0x54:
         return None
 
-    # Check for the 55 54 magic header
-    if data[0] == 0x55 and data[1] == 0x54:
-        status = data[2]
-        x = data[3] | (data[4] << 8) | (data[9] << 16)
-        y = data[5] | (data[6] << 8) | (data[10] << 16)
-        pressure = struct.unpack_from("<H", data, 7)[0]
-        tilt_x = struct.unpack_from("<b", data, 11)[0]
-        tilt_y = struct.unpack_from("<b", data, 12)[0]
-        return (status, x, y, pressure, tilt_x, tilt_y)
-
-    # Fallback: USB HID format (0x08 prefix, from cached/converted data)
-    if data[0] == REPORT_ID_PEN and len(data) >= 12:
-        status = data[1]
-        if status >= PEN_TYPE_MAX:
-            return None
-        x = data[2] | (data[3] << 8)
-        y = data[4] | (data[5] << 8)
-        if len(data) > 9:
-            x |= data[8] << 16
-            y |= data[9] << 16
-        pressure = struct.unpack_from("<H", data, 6)[0]
-        tilt_x = struct.unpack_from("<b", data, 10)[0] if len(data) > 10 else 0
-        tilt_y = struct.unpack_from("<b", data, 11)[0] if len(data) > 11 else 0
-        return (status, x, y, pressure, tilt_x, tilt_y)
-
-    return None
+    status = data[2]
+    x = data[3] | (data[4] << 8) | (data[9] << 16)
+    y = data[5] | (data[6] << 8) | (data[10] << 16)
+    pressure = struct.unpack_from("<H", data, 7)[0]
+    tilt_x = struct.unpack_from("<b", data, 11)[0]
+    tilt_y = struct.unpack_from("<b", data, 12)[0]
+    return (status, x, y, pressure, tilt_x, tilt_y)
 
 
 def parse_tablet_device_info(data: bytes) -> dict:
@@ -450,31 +424,6 @@ class BLEConnection:
             self.bus.disconnect()
 
 
-# ─── HOGP mitigation ────────────────────────────────────────────────────────
-
-def _unbind_hid_generic():
-    """Unbind the Note X10 from hid-generic to prevent HOGP from killing
-    FFE1 notifications. Called after each reconnect.
-
-    With the udev rule installed (99-huion-note-x10.rules), this happens
-    automatically. This is a fallback for when udev hasn't fired yet or
-    the rule isn't installed."""
-    import glob as glob_mod
-    for dev_path in glob_mod.glob("/sys/bus/hid/devices/0005:256C:8251.*"):
-        dev_id = os.path.basename(dev_path)
-        driver_link = os.path.join(dev_path, "driver")
-        if os.path.islink(driver_link) and "hid-generic" in os.readlink(driver_link):
-            try:
-                with open("/sys/bus/hid/drivers/hid-generic/unbind", "w") as f:
-                    f.write(dev_id)
-                log.info("Unbound %s from hid-generic", dev_id)
-            except PermissionError:
-                log.warning("Cannot unbind hid-generic (not root). "
-                            "Install 99-huion-note-x10.rules to fix this.")
-            except OSError as e:
-                log.debug("Unbind skipped: %s", e)
-
-
 # ─── Driver core ─────────────────────────────────────────────────────────────
 
 class HuionBLEDriver:
@@ -487,7 +436,7 @@ class HuionBLEDriver:
         self.device_name = "unknown"
         self._running = True
         self._disconnect_event = asyncio.Event()
-        # Pen data arrives via D-Bus PropertiesChanged signals (no raw fd)
+        self._notify_fd: int | None = None
         self._pen_was_active = False
         self._handshake_responses: dict[int, bytes] = {}
         self._stats = {"samples": 0, "reconnects": 0}
@@ -497,13 +446,9 @@ class HuionBLEDriver:
     def _on_notification(self, data: bytes):
         if not data:
             return
-        # Log raw data — verbose for first 10 packets, then debug only
-        if self._stats["samples"] < 10:
-            log.info("RAW[%d] (%d bytes): %s", self._stats["samples"], len(data), data.hex())
-        else:
-            log.debug("RAW (%d bytes): %s", len(data), data[:30].hex())
+        log.debug("RAW (%d bytes): %s", len(data), data[:30].hex())
 
-        # Try parsing as pen data (handles 55 54 and 08 formats)
+        # Try parsing as pen data (55 54 header, 14 bytes)
         report = parse_tablet_pen_report(data)
         if report is not None:
             status, x, y, pressure, tilt_x, tilt_y = report
@@ -569,8 +514,6 @@ class HuionBLEDriver:
             log.error("AcquireNotify failed — GATT characteristics not available")
             return False
 
-        _unbind_hid_generic()
-
         if not await self._send_handshake():
             return False
         log.info("Handshake complete")
@@ -626,12 +569,8 @@ class HuionBLEDriver:
     async def _keepalive_loop(self):
         """Send battery query as keepalive. Recreated per session."""
         cmd = build_tablet_cmd(CMD_TABLET_BATTERY)
-        # Skip the first keepalive — let the connection stabilize
-        await asyncio.sleep(KEEPALIVE_INTERVAL)
         while self._running:
-            ok = await self.ble.write_cmd(cmd)
-            if not ok:
-                log.warning("Keepalive write failed — connection may be dead")
+            await self.ble.write_cmd(cmd)
             await asyncio.sleep(KEEPALIVE_INTERVAL)
 
     # ── Session loop (keepalive lifecycle + reconnect) ──
@@ -669,9 +608,8 @@ class HuionBLEDriver:
                         break
                 except Exception as e:
                     log.warning("Reconnect error: %s", e)
-                # AcquireNotify fails on stale GATT state — wait for a
-                # device-initiated disconnect to get a fresh GATT client.
-                # Device disconnects every ~3-5s on its own.
+                # AcquireNotify may fail on stale GATT state — wait for
+                # a device-initiated disconnect to get a fresh GATT client.
                 try:
                     await asyncio.wait_for(
                         self._disconnect_event.wait(), timeout=15.0)
@@ -689,19 +627,13 @@ class HuionBLEDriver:
         await self.ble.connect_bus()
         await self.ble.setup_signals(self._on_notification, self._on_disconnect)
 
-        for attempt in range(10):
+        for attempt in range(5):
             if await self._connect_and_handshake():
                 break
-            # AcquireNotify fails on stale connections. Wait for the device
-            # to disconnect (e.g. cover close) which gives us a fresh link.
-            log.info("Waiting for fresh BLE connection (close/open tablet cover)...")
-            self._disconnect_event.clear()
-            try:
-                await asyncio.wait_for(self._disconnect_event.wait(), timeout=30.0)
-            except asyncio.TimeoutError:
-                pass
-            # Small delay for BlueZ to process the reconnect
-            await asyncio.sleep(1.0)
+            backoff = min(2.0 * (attempt + 1), 10.0)
+            log.warning("Connection attempt %d failed, retry in %.0fs...",
+                        attempt + 1, backoff)
+            await asyncio.sleep(backoff)
         else:
             log.error("Initial connection failed. Make sure the tablet is powered on.")
             return
@@ -727,7 +659,8 @@ class HuionBLEDriver:
         session = asyncio.create_task(self._session_loop())
 
         try:
-            last_report = time.monotonic()
+            start_time = time.monotonic()
+            last_report = start_time
             total_samples = 0
             idle_warned = False
             while self._running:
@@ -740,12 +673,10 @@ class HuionBLEDriver:
                 total_samples += self._stats["samples"]
                 self._stats["samples"] = 0
                 last_report = now
-                if total_samples == 0 and not idle_warned and now - last_report > -1:
-                    # Check after ~10s of running
-                    if (now - last_report + elapsed) > 9:
-                        log.warning("No pen data yet — close and reopen the tablet "
-                                    "cover to activate pen tablet mode")
-                        idle_warned = True
+                if total_samples == 0 and not idle_warned and (now - start_time) > 10:
+                    log.warning("No pen data yet — close and reopen the tablet "
+                                "cover to activate pen tablet mode")
+                    idle_warned = True
         except asyncio.CancelledError:
             pass
         finally:
