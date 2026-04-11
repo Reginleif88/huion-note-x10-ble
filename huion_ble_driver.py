@@ -15,6 +15,7 @@ Requires: dbus_fast (pip install dbus-fast), /dev/uinput accessible
 import argparse
 import asyncio
 import fcntl
+import json
 import logging
 import os
 import signal
@@ -138,6 +139,152 @@ class UInputDevice:
                 pass
             os.close(self.fd)
             self.fd = -1
+
+
+# ─── Region mapping (tablet → editor pane) ───────────────────────────────────
+
+REGION_SOCKET_PATH = "/tmp/tablet-region.sock"
+
+
+class RegionMapper:
+    """Transforms raw tablet coordinates to map the full tablet surface onto
+    a sub-region of the screen (the Obsidian editor pane).
+
+    Accounts for Hyprland's input:tablet:transform = 3 (270° rotation):
+      - raw ABS_Y → screen X
+      - raw ABS_X (inverted) → screen Y
+    """
+
+    def __init__(self, max_x: int, max_y: int):
+        self.max_x = max_x
+        self.max_y = max_y
+        self.active = False
+        # Region and monitor in screen-space pixels
+        self._region: dict | None = None  # {x, y, width, height}
+        self._monitor: dict | None = None  # {x, y, width, height}
+        self._monitor_name: str | None = None
+
+    def update(self, region: dict, monitor: dict, monitor_name: str = "") -> None:
+        self._region = region
+        self._monitor = monitor
+        # Switch tablet output to follow Obsidian's monitor
+        if monitor_name and monitor_name != self._monitor_name:
+            self._monitor_name = monitor_name
+            self._switch_tablet_output(monitor_name)
+        self.active = True
+        log.info("Region mapping: region=(%d,%d %dx%d) monitor=%s (%d,%d %dx%d)",
+                 region["x"], region["y"], region["width"], region["height"],
+                 monitor_name,
+                 monitor["x"], monitor["y"], monitor["width"], monitor["height"])
+
+    @staticmethod
+    def _switch_tablet_output(monitor_name: str) -> None:
+        """Tell Hyprland to map the tablet to the given monitor."""
+        import subprocess
+        try:
+            subprocess.run(
+                ["hyprctl", "keyword", "input:tablet:output", monitor_name],
+                capture_output=True, timeout=2.0)
+            log.info("Switched tablet output to %s", monitor_name)
+        except Exception as e:
+            log.warning("Failed to switch tablet output: %s", e)
+
+    def deactivate(self) -> None:
+        self.active = False
+        log.info("Region mapping deactivated")
+
+    def transform(self, raw_x: int, raw_y: int) -> tuple[int, int]:
+        """Transform raw tablet coords so Hyprland (after 270° rotation)
+        places the pen inside the target screen region.
+
+        With transform 3, Hyprland maps:
+          screen_x = monitor.x + (abs_y / max_y) * monitor.w
+          screen_y = monitor.y + (1 - abs_x / max_x) * monitor.h
+
+        We want the pen's full range [0..max] to land inside region:
+          target_x = region.x + norm_x * region.w
+          target_y = region.y + norm_y * region.h
+
+        where norm_x = raw_y / max_y, norm_y = 1 - raw_x / max_x
+        (physical pen position in portrait orientation).
+
+        Solving for the abs values to inject:
+          abs_y = max_y * (region.x - monitor.x + norm_x * region.w) / monitor.w
+          abs_x = max_x * (1 - (region.y - monitor.y + norm_y * region.h) / monitor.h)
+        """
+        if not self._region or not self._monitor:
+            return raw_x, raw_y
+
+        r = self._region
+        m = self._monitor
+
+        # Normalized pen position (0..1) in portrait orientation
+        norm_x = raw_y / self.max_y if self.max_y > 0 else 0
+        norm_y = 1.0 - (raw_x / self.max_x) if self.max_x > 0 else 0
+
+        # Target screen position
+        target_sx = r["x"] + norm_x * r["width"]
+        target_sy = r["y"] + norm_y * r["height"]
+
+        # Solve for abs values that produce this screen position after transform 3
+        abs_y = self.max_y * (target_sx - m["x"]) / m["width"] if m["width"] > 0 else 0
+        abs_x = self.max_x * (1.0 - (target_sy - m["y"]) / m["height"]) if m["height"] > 0 else 0
+
+        # Clamp to valid range
+        abs_x = max(0, min(self.max_x, int(abs_x)))
+        abs_y = max(0, min(self.max_y, int(abs_y)))
+
+        return abs_x, abs_y
+
+
+async def region_socket_client(mapper: RegionMapper, running_check,
+                               battery_getter=None,
+                               socket_path: str = REGION_SOCKET_PATH):
+    """Connect to the Obsidian plugin's Unix socket and receive region updates.
+    Reconnects automatically if the plugin restarts."""
+    log = logging.getLogger("huion-ble.region")
+
+    while running_check():
+        try:
+            reader, writer = await asyncio.open_unix_connection(socket_path)
+            log.info("Connected to region socket %s", socket_path)
+
+            # Send driver status
+            if battery_getter:
+                status = {"type": "driver_status", "connected": True,
+                          "battery": battery_getter()}
+                writer.write((json.dumps(status) + "\n").encode())
+                await writer.drain()
+
+            while running_check():
+                line = await reader.readline()
+                if not line:
+                    log.info("Region socket closed by plugin")
+                    break
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    log.warning("Invalid JSON from plugin: %s", line[:100])
+                    continue
+
+                if msg.get("type") == "region":
+                    mapper.update(msg["region"], msg["monitor"],
+                                  msg.get("monitorName", ""))
+                elif msg.get("type") == "inactive":
+                    mapper.deactivate()
+
+            writer.close()
+        except (ConnectionRefusedError, FileNotFoundError):
+            # Plugin not running — wait and retry
+            pass
+        except OSError as e:
+            log.debug("Region socket error: %s", e)
+        except asyncio.CancelledError:
+            break
+
+        mapper.deactivate()
+        if running_check():
+            await asyncio.sleep(2.0)  # Retry interval
 
 
 # ─── Protocol parsers ────────────────────────────────────────────────────────
@@ -440,6 +587,7 @@ class HuionBLEDriver:
         self._pen_was_active = False
         self._handshake_responses: dict[int, bytes] = {}
         self._stats = {"samples": 0, "reconnects": 0}
+        self.region_mapper = RegionMapper(self.max_x, self.max_y)
 
     # ── Notification handling ──
 
@@ -473,6 +621,9 @@ class HuionBLEDriver:
         if not self.uinput or self.uinput.fd < 0:
             log.info("PEN: x=%d y=%d p=%d tx=%d ty=%d", x, y, pressure, tilt_x, tilt_y)
             return
+        # Apply region mapping if active
+        if self.region_mapper.active:
+            x, y = self.region_mapper.transform(x, y)
         pen_active = pressure > 0 or x > 0 or y > 0
         if pen_active:
             self.uinput.report(x, y, pressure, True, tilt_x, tilt_y)
@@ -627,15 +778,15 @@ class HuionBLEDriver:
         await self.ble.connect_bus()
         await self.ble.setup_signals(self._on_notification, self._on_disconnect)
 
-        for attempt in range(5):
+        backoff = 2.0
+        while self._running:
             if await self._connect_and_handshake():
                 break
-            backoff = min(2.0 * (attempt + 1), 10.0)
-            log.warning("Connection attempt %d failed, retry in %.0fs...",
-                        attempt + 1, backoff)
+            log.info("Connection failed, retry in %.0fs... "
+                     "(close/open tablet cover for fresh BLE link)", backoff)
             await asyncio.sleep(backoff)
-        else:
-            log.error("Initial connection failed. Make sure the tablet is powered on.")
+            backoff = min(backoff * 1.5, 30.0)
+        if not self._running:
             return
 
         self.uinput = UInputDevice(self.max_x, self.max_y, self.max_pressure)
@@ -657,6 +808,9 @@ class HuionBLEDriver:
         print(f"  If no pen data, close and reopen the tablet cover.\n")
 
         session = asyncio.create_task(self._session_loop())
+        region_client = asyncio.create_task(
+            region_socket_client(self.region_mapper,
+                                 running_check=lambda: self._running))
 
         try:
             start_time = time.monotonic()
@@ -681,6 +835,7 @@ class HuionBLEDriver:
             pass
         finally:
             session.cancel()
+            region_client.cancel()
 
     async def shutdown(self):
         log.info("Shutting down...")

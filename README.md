@@ -7,11 +7,13 @@
 
 Userspace BLE driver for the Huion Note X10 pen tablet on Linux. Reverse-engineered from Huion's macOS/Windows v15 drivers via Ghidra and Android BLE captures.
 
+> **Requires a patched BlueZ.** The Huion Note X10 firmware has a bug where it sends duplicate ATT protocol requests after every BLE connection parameter update (~every 5-8s). Unpatched BlueZ 5.x treats this as a protocol violation and disconnects, making the tablet unusable. A [2-line patch](#bluez-patch-required) to BlueZ's `src/shared/att.c` fixes this. See [installation](#bluez-patch-required) for details.
+
 > Codebase maintained with [Claude Code](https://claude.ai/code).
 >
 > **This is not an official Huion product.** The BLE protocol was reverse-engineered because Huion's official Linux driver deliberately disables BLE support.
 >
-> Only tested on NixOS so far. Should work on any Linux with BlueZ 5.x — reports from other distros welcome.
+> Only tested on NixOS so far. Should work on any Linux with BlueZ 5.x (patched) — reports from other distros welcome.
 
 ## Installation
 
@@ -103,10 +105,37 @@ and active area configuration are handled by existing Linux tools:
 
 - **Krita / GIMP / MyPaint** — built-in pressure curve editors under tablet/input settings
 
+## BlueZ Patch (Required)
+
+The Huion Note X10 firmware sends duplicate `Exchange MTU Request` packets after every BLE connection parameter update. Unpatched BlueZ treats this as a protocol violation and disconnects, killing the pen data stream every ~4 seconds.
+
+A 2-line patch to `src/shared/att.c` drops the duplicate instead of disconnecting:
+
+```diff
+--- a/src/shared/att.c
++++ b/src/shared/att.c
+@@ -1082,9 +1082,8 @@
+ 		if (chan->in_req) {
+ 			DBG(att, "(chan %p) Received request while "
+-					"another is pending: 0x%02x",
++					"another is pending: 0x%02x "
++					"(dropping duplicate)",
+ 					chan, opcode);
+-			io_shutdown(chan->io);
+-			bt_att_unref(chan->att);
+-			return false;
++			return true;
+ 		}
+```
+
+**NixOS:** Applied automatically via `hardware.bluetooth.package` overlay — see `modules/huion-ble.nix`.
+
+**Other distros:** Apply the patch to BlueZ 5.84 source and rebuild, or copy `patches/fix-duplicate-mtu-request.patch` and use your distro's package override mechanism.
+
 ## How It Works
 
-1. Connects via BlueZ D-Bus, acquires raw fds with `AcquireNotify`/`AcquireWrite` (bypasses HOGP)
-2. Unbinds `hid-generic` to prevent HOGP from killing GATT notifications
+1. Connects via BlueZ D-Bus, acquires raw fds with `AcquireNotify`/`AcquireWrite`
+2. Enables indications on FFE2 via `StartNotify` (CCCD write — triggers pen tablet mode)
 3. Sends Pen Tablet Mode handshake: `cd c9/c8/ca 00 00 00 00 00 00`
 4. Reads `55 54` pen data packets from FFE1 notification fd
 5. Injects `ABS_X`, `ABS_Y`, `ABS_PRESSURE`, `ABS_TILT_X/Y` into `/dev/uinput`
@@ -114,9 +143,10 @@ and active area configuration are handled by existing Linux tools:
 
 ```text
 ┌──────────────┐    BLE GATT     ┌───────────────────────┐
-│  Huion Note  │◄───────────────►│  BlueZ (D-Bus)        │
+│  Huion Note  │◄───────────────►│  BlueZ (patched)      │
 │     X10      │  FFE0 service   │                       │
 │              │  FFE1: notify   │  AcquireNotify → fd   │
+│              │  FFE2: indicate │  StartNotify (CCCD)   │
 │              │  FFE2: write    │  AcquireWrite  → fd   │
 └──────────────┘                 └──────────┬────────────┘
                                             │ raw fds
@@ -156,7 +186,7 @@ and active area configuration are handled by existing Linux tools:
 
 - Python 3.10+
 - [`dbus-fast`](https://github.com/Bluetooth-Devices/dbus-fast) — async D-Bus client for BlueZ
-- BlueZ 5.x
+- BlueZ 5.x (**patched** — see above)
 - Linux kernel 4.5+ (for `UI_DEV_SETUP` / `UI_ABS_SETUP` uinput ioctls)
 
 ## Reverse Engineering
@@ -169,7 +199,9 @@ The BLE protocol is completely undocumented. It was reverse-engineered in three 
 
 3. **Ghidra RE of macOS driver** — Analyzed `libTabletSession.dylib` to find Pen Tablet Mode, which uses different command IDs (`0xC8/0xC9/0xCA/0xD1`) and pen data format (`55 54` header, 14 bytes, 24-bit coords + tilt).
 
-Key challenge: the device has multiple modes determined by which app connects. A generic BLE connection leaves it in idle mode where it acknowledges commands but never sends pen data.
+Key discoveries:
+- The device enters pen tablet mode when FFE2's CCCD indicate bit is written (`StartNotify` on FFE2) — found by RE of macOS driver's `setNotifyValue:1` on both characteristics.
+- The device firmware sends 9 duplicate ATT MTU requests after every connection parameter update, which crashes BlueZ's GATT client — fixed by a 2-line patch to `att.c`.
 
 See [`notes/journey.md`](notes/journey.md) for the full RE session log.
 
@@ -177,9 +209,12 @@ See [`notes/journey.md`](notes/journey.md) for the full RE session log.
 
 ```text
 huion_ble_driver.py             — BLE tablet driver (dbus_fast + uinput)
+patches/
+  fix-duplicate-mtu-request.patch — BlueZ att.c patch for firmware MTU bug
 huion-note-x10.service          — systemd user service
 99-huion-note-x10.rules         — udev rules (uinput access + HOGP unbind)
 notes/journey.md                — Full RE session log
+Archives/                       — RE artifacts (Ghidra, captures, scripts)
 ```
 
 ## License

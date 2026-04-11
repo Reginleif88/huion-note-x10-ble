@@ -1,0 +1,18 @@
+--- a/src/shared/att.c
++++ b/src/shared/att.c
+@@ -1080,12 +1080,10 @@
+ 		 */
+ 		if (chan->in_req) {
+ 			DBG(att, "(chan %p) Received request while "
+-					"another is pending: 0x%02x",
++					"another is pending: 0x%02x "
++					"(dropping duplicate)",
+ 					chan, opcode);
+-			io_shutdown(chan->io);
+-			bt_att_unref(chan->att);
+-
+-			return false;
++			return true;
+ 		}
+
+ 		chan->in_req = true;
