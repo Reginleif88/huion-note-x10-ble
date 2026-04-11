@@ -7,7 +7,7 @@
 
 Userspace BLE driver for the Huion Note X10 pen tablet on Linux. Reverse-engineered from Huion's macOS/Windows v15 drivers via Ghidra and Android BLE captures.
 
-> **Requires a patched BlueZ.** The Huion Note X10 firmware has a bug where it sends duplicate ATT protocol requests after every BLE connection parameter update (~every 5-8s). Unpatched BlueZ 5.x treats this as a protocol violation and disconnects, making the tablet unusable. A [2-line patch](#bluez-patch-required) to BlueZ's `src/shared/att.c` fixes this. See [installation](#bluez-patch-required) for details.
+> **Requires a patched BlueZ.** The Huion Note X10 firmware has a bug where it sends duplicate ATT protocol requests after every BLE connection parameter update (~every 5-8s). Unpatched BlueZ 5.x treats this as a protocol violation and disconnects, making the tablet unusable. A [2-line patch](#1-patch-bluez-required) to BlueZ's `src/shared/att.c` fixes this. See [step 1 of installation](#1-patch-bluez-required).
 
 > Codebase maintained with [Claude Code](https://claude.ai/code).
 >
@@ -17,18 +17,101 @@ Userspace BLE driver for the Huion Note X10 pen tablet on Linux. Reverse-enginee
 
 ## Installation
 
-### 1. Install dependency
+### 1. Patch BlueZ (required)
+
+The Huion Note X10 firmware sends duplicate `Exchange MTU Request` packets after every BLE connection parameter update. Unpatched BlueZ treats this as a protocol violation and disconnects, killing the pen data stream every ~4 seconds.
+
+A 2-line patch to `src/shared/att.c` drops the duplicate instead of disconnecting:
+
+```diff
+--- a/src/shared/att.c
++++ b/src/shared/att.c
+@@ -1082,9 +1082,8 @@
+ 		if (chan->in_req) {
+ 			DBG(att, "(chan %p) Received request while "
+-					"another is pending: 0x%02x",
++					"another is pending: 0x%02x "
++					"(dropping duplicate)",
+ 					chan, opcode);
+-			io_shutdown(chan->io);
+-			bt_att_unref(chan->att);
+-			return false;
++			return true;
+ 		}
+```
+
+**NixOS:** Applied automatically via `hardware.bluetooth.package` overlay — see `modules/huion-ble.nix`.
+
+<details>
+<summary><strong>Debian / Ubuntu</strong></summary>
+
+```bash
+sudo apt build-dep bluez && sudo apt install devscripts
+apt source bluez && cd bluez-*/
+cp /path/to/patches/fix-duplicate-mtu-request.patch .
+patch -p1 < fix-duplicate-mtu-request.patch
+debuild -us -uc -b
+cd .. && sudo dpkg -i bluez_*.deb
+sudo apt-mark hold bluez
+sudo systemctl restart bluetooth
+```
+
+</details>
+
+<details>
+<summary><strong>Arch Linux</strong></summary>
+
+```bash
+asp update bluez && asp checkout bluez && cd bluez/trunk/
+cp /path/to/patches/fix-duplicate-mtu-request.patch .
+# Add to PKGBUILD prepare(): patch -p1 < "$srcdir/../fix-duplicate-mtu-request.patch"
+makepkg -si
+```
+
+</details>
+
+<details>
+<summary><strong>Fedora</strong></summary>
+
+```bash
+sudo dnf install rpm-build dnf-utils && sudo dnf builddep bluez
+dnf download --source bluez && rpm -i bluez-*.src.rpm
+cp /path/to/patches/fix-duplicate-mtu-request.patch ~/rpmbuild/SOURCES/
+# Edit ~/rpmbuild/SPECS/bluez.spec — add PatchN and %patchN lines
+rpmbuild -bb ~/rpmbuild/SPECS/bluez.spec
+sudo rpm -Uvh ~/rpmbuild/RPMS/x86_64/bluez-*.rpm
+sudo systemctl restart bluetooth
+```
+
+</details>
+
+<details>
+<summary><strong>From source (any distro)</strong></summary>
+
+```bash
+wget https://www.kernel.org/pub/linux/bluetooth/bluez-5.84.tar.xz
+tar xf bluez-5.84.tar.xz && cd bluez-5.84/
+patch -p1 < /path/to/patches/fix-duplicate-mtu-request.patch
+./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
+  --enable-library --enable-tools
+make -j$(nproc) && sudo make install
+sudo systemctl restart bluetooth
+```
+
+</details>
+
+### 2. Install dependency
 
 ```bash
 pip install dbus-fast
 # or: nix-shell -p python3Packages.dbus-fast
 ```
 
-### 2. Pair the tablet
+### 3. Pair the tablet
 
 Power on the tablet and pair it via your desktop's Bluetooth settings (or `bluetoothctl`). Trust the device so it reconnects automatically.
 
-### 3. Install udev rules
+### 4. Install udev rules
 
 These grant your user access to `/dev/uinput` and auto-unbind `hid-generic` when the tablet connects (preventing HOGP interference).
 
@@ -40,7 +123,7 @@ sudo usermod -aG input $USER
 
 Log out and back in for the group change to take effect.
 
-### 4. Install the driver
+### 5. Install the driver
 
 ```bash
 mkdir -p ~/.local/share/huion-note-x10
@@ -63,7 +146,7 @@ ExecStart=
 ExecStart=/usr/bin/python3 %h/.local/share/huion-note-x10/huion_ble_driver.py --mac XX:XX:XX:XX:XX:XX
 ```
 
-### 5. Verify
+### 6. Verify
 
 ```bash
 # Check service status
@@ -104,139 +187,6 @@ and active area configuration are handled by existing Linux tools:
   ```
 
 - **Krita / GIMP / MyPaint** — built-in pressure curve editors under tablet/input settings
-
-## BlueZ Patch (Required)
-
-The Huion Note X10 firmware sends duplicate `Exchange MTU Request` packets after every BLE connection parameter update. Unpatched BlueZ treats this as a protocol violation and disconnects, killing the pen data stream every ~4 seconds.
-
-A 2-line patch to `src/shared/att.c` drops the duplicate instead of disconnecting:
-
-```diff
---- a/src/shared/att.c
-+++ b/src/shared/att.c
-@@ -1082,9 +1082,8 @@
- 		if (chan->in_req) {
- 			DBG(att, "(chan %p) Received request while "
--					"another is pending: 0x%02x",
-+					"another is pending: 0x%02x "
-+					"(dropping duplicate)",
- 					chan, opcode);
--			io_shutdown(chan->io);
--			bt_att_unref(chan->att);
--			return false;
-+			return true;
- 		}
-```
-
-**NixOS:** Applied automatically via `hardware.bluetooth.package` overlay — see `modules/huion-ble.nix`.
-
-<details>
-<summary><strong>Debian / Ubuntu</strong></summary>
-
-```bash
-# Install build dependencies
-sudo apt build-dep bluez
-sudo apt install devscripts
-
-# Get the source
-apt source bluez
-cd bluez-*/
-
-# Apply the patch
-cp /path/to/patches/fix-duplicate-mtu-request.patch .
-patch -p1 < fix-duplicate-mtu-request.patch
-
-# Build the patched package
-debuild -us -uc -b
-
-# Install it
-cd ..
-sudo dpkg -i bluez_*.deb
-
-# Pin the package so apt doesn't overwrite it
-sudo apt-mark hold bluez
-
-# Restart bluetooth
-sudo systemctl restart bluetooth
-```
-
-After a distro BlueZ update, re-apply the patch and rebuild.
-
-</details>
-
-<details>
-<summary><strong>Arch Linux</strong></summary>
-
-```bash
-# Get the PKGBUILD
-asp update bluez
-asp checkout bluez
-cd bluez/trunk/
-
-# Copy the patch
-cp /path/to/patches/fix-duplicate-mtu-request.patch .
-
-# Add to PKGBUILD: in the prepare() function, add:
-#   patch -p1 < "$srcdir/../fix-duplicate-mtu-request.patch"
-# Or add to the source= and sha256sums= arrays
-
-# Build and install
-makepkg -si
-```
-
-</details>
-
-<details>
-<summary><strong>Fedora</strong></summary>
-
-```bash
-# Install build tools
-sudo dnf install rpm-build dnf-utils
-sudo dnf builddep bluez
-
-# Get the source RPM
-dnf download --source bluez
-rpm -i bluez-*.src.rpm
-
-# Add the patch to ~/rpmbuild/SOURCES/
-cp /path/to/patches/fix-duplicate-mtu-request.patch ~/rpmbuild/SOURCES/
-
-# Edit the spec file to apply the patch
-# In ~/rpmbuild/SPECS/bluez.spec, add after existing Patch lines:
-#   PatchN: fix-duplicate-mtu-request.patch
-# And in %prep after existing %patch lines:
-#   %patchN -p1
-
-# Build
-rpmbuild -bb ~/rpmbuild/SPECS/bluez.spec
-
-# Install
-sudo rpm -Uvh ~/rpmbuild/RPMS/x86_64/bluez-*.rpm
-
-sudo systemctl restart bluetooth
-```
-
-</details>
-
-<details>
-<summary><strong>From source (any distro)</strong></summary>
-
-```bash
-wget https://www.kernel.org/pub/linux/bluetooth/bluez-5.84.tar.xz
-tar xf bluez-5.84.tar.xz
-cd bluez-5.84/
-
-patch -p1 < /path/to/patches/fix-duplicate-mtu-request.patch
-
-./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
-  --enable-library --enable-tools
-make -j$(nproc)
-sudo make install
-
-sudo systemctl restart bluetooth
-```
-
-</details>
 
 ## How It Works
 
