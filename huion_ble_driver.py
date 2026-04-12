@@ -18,6 +18,7 @@ import fcntl
 import json
 import logging
 import os
+import shutil
 import signal
 import struct
 import time
@@ -146,6 +147,29 @@ class UInputDevice:
 REGION_SOCKET_PATH = "/tmp/tablet-region.sock"
 
 
+def _resolve_hyprctl() -> str | None:
+    """Find hyprctl binary. Systemd user services on NixOS run with a minimal
+    PATH (coreutils/findutils/etc only), so hyprctl is not resolvable via
+    bare-name lookup. Cache the absolute path once at startup."""
+    found = shutil.which("hyprctl")
+    if found:
+        return found
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "nobody"
+    candidates = [
+        f"/etc/profiles/per-user/{user}/bin/hyprctl",
+        "/run/current-system/sw/bin/hyprctl",
+        "/usr/bin/hyprctl",
+        "/usr/local/bin/hyprctl",
+    ]
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+HYPRCTL = _resolve_hyprctl()
+
+
 class RegionMapper:
     """Transforms raw tablet coordinates to map the full tablet surface onto
     a sub-region of the screen (the Obsidian editor pane).
@@ -181,10 +205,18 @@ class RegionMapper:
     def _switch_tablet_output(monitor_name: str) -> None:
         """Tell Hyprland to map the tablet to the given monitor."""
         import subprocess
+        if not HYPRCTL:
+            log.warning("Cannot switch tablet output: hyprctl not found in PATH "
+                        "or standard locations")
+            return
         try:
-            subprocess.run(
-                ["hyprctl", "keyword", "input:tablet:output", monitor_name],
-                capture_output=True, timeout=2.0)
+            result = subprocess.run(
+                [HYPRCTL, "keyword", "input:tablet:output", monitor_name],
+                capture_output=True, text=True, timeout=2.0)
+            if result.returncode != 0:
+                log.warning("hyprctl keyword rc=%d stderr=%r",
+                            result.returncode, result.stderr.strip())
+                return
             log.info("Switched tablet output to %s", monitor_name)
         except Exception as e:
             log.warning("Failed to switch tablet output: %s", e)
@@ -586,8 +618,12 @@ class HuionBLEDriver:
         self._notify_fd: int | None = None
         self._pen_was_active = False
         self._handshake_responses: dict[int, bytes] = {}
-        self._stats = {"samples": 0, "reconnects": 0}
+        self._stats = {"samples": 0, "reconnects": 0,
+                       "raw_x_min": None, "raw_x_max": None,
+                       "raw_y_min": None, "raw_y_max": None}
         self.region_mapper = RegionMapper(self.max_x, self.max_y)
+        log.info("hyprctl resolved to: %s",
+                 HYPRCTL or "(not found — monitor switching disabled)")
 
     # ── Notification handling ──
 
@@ -618,6 +654,13 @@ class HuionBLEDriver:
 
     def _emit_pen(self, x: int, y: int, pressure: int, tilt_x: int = 0, tilt_y: int = 0):
         """Emit pen data to uinput."""
+        # Track raw input range (pre-transform) for calibration diagnostics
+        s = self._stats
+        if s["raw_x_min"] is None or x < s["raw_x_min"]: s["raw_x_min"] = x
+        if s["raw_x_max"] is None or x > s["raw_x_max"]: s["raw_x_max"] = x
+        if s["raw_y_min"] is None or y < s["raw_y_min"]: s["raw_y_min"] = y
+        if s["raw_y_max"] is None or y > s["raw_y_max"]: s["raw_y_max"] = y
+
         if not self.uinput or self.uinput.fd < 0:
             log.info("PEN: x=%d y=%d p=%d tx=%d ty=%d", x, y, pressure, tilt_x, tilt_y)
             return
@@ -631,7 +674,7 @@ class HuionBLEDriver:
         elif self._pen_was_active:
             self.uinput.pen_up()
             self._pen_was_active = False
-        self._stats["samples"] += 1
+        s["samples"] += 1
 
     def _on_disconnect(self):
         self._disconnect_event.set()
@@ -821,11 +864,20 @@ class HuionBLEDriver:
                 await asyncio.sleep(5.0)
                 now = time.monotonic()
                 elapsed = now - last_report
-                rate = self._stats["samples"] / elapsed if elapsed > 0 else 0
-                log.info("samples=%d (%.0f/s), reconnects=%d",
-                         self._stats["samples"], rate, self._stats["reconnects"])
-                total_samples += self._stats["samples"]
-                self._stats["samples"] = 0
+                s = self._stats
+                rate = s["samples"] / elapsed if elapsed > 0 else 0
+                rx = (f"{s['raw_x_min']}-{s['raw_x_max']}"
+                      if s["raw_x_min"] is not None else "-")
+                ry = (f"{s['raw_y_min']}-{s['raw_y_max']}"
+                      if s["raw_y_min"] is not None else "-")
+                log.info("samples=%d (%.0f/s), reconnects=%d, "
+                         "raw_x=%s/%d raw_y=%s/%d",
+                         s["samples"], rate, s["reconnects"],
+                         rx, self.max_x, ry, self.max_y)
+                total_samples += s["samples"]
+                s["samples"] = 0
+                s["raw_x_min"] = s["raw_x_max"] = None
+                s["raw_y_min"] = s["raw_y_max"] = None
                 last_report = now
                 if total_samples == 0 and not idle_warned and (now - start_time) > 10:
                     log.warning("No pen data yet — close and reopen the tablet "
