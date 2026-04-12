@@ -128,29 +128,46 @@ Log out and back in for the group change to take effect.
 ```bash
 mkdir -p ~/.local/share/huion-note-x10
 cp huion_ble_driver.py ~/.local/share/huion-note-x10/
-
-cp huion-note-x10.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now huion-note-x10
 ```
 
-The driver auto-detects the tablet by its Bluetooth vendor/product ID. If you have multiple Huion devices, set the MAC explicitly by editing the service file:
+Pick the service file that matches how you hold the tablet, copy it, and
+enable it. Install **one** of the two — not both.
 
 ```bash
-systemctl --user edit huion-note-x10
+# Portrait (most common — Note X10 held vertically, writing orientation):
+cp huion-note-x10-portrait.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now huion-note-x10-portrait
+
+# Landscape (tablet's native coordinate frame, short edge horizontal):
+cp huion-note-x10-landscape.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now huion-note-x10-landscape
+```
+
+If you picked the wrong one, disable it (`systemctl --user disable --now ...`)
+before enabling the other.
+
+To customize further — pin a specific MAC, use a different rotation
+(`portrait_ccw`, `inverted`), or enable debug logging — use a drop-in:
+
+```bash
+systemctl --user edit huion-note-x10-portrait   # or -landscape
 ```
 
 ```ini
 [Service]
 ExecStart=
-ExecStart=/usr/bin/python3 %h/.local/share/huion-note-x10/huion_ble_driver.py --mac XX:XX:XX:XX:XX:XX
+ExecStart=/usr/bin/python3 %h/.local/share/huion-note-x10/huion_ble_driver.py --orientation portrait_ccw --mac XX:XX:XX:XX:XX:XX
 ```
+
+The empty `ExecStart=` line clears the vendor default; the second line replaces it.
 
 ### 6. Verify
 
 ```bash
-# Check service status
-systemctl --user status huion-note-x10
+# Check service status (substitute -landscape if you picked that variant)
+systemctl --user status huion-note-x10-portrait
 
 # Check the virtual input device
 libinput list-devices | grep -A5 "Huion Note X10"
@@ -158,7 +175,9 @@ libinput list-devices | grep -A5 "Huion Note X10"
 # Watch raw pen events
 sudo evtest    # pick "Huion Note X10 BLE"
 
-# Confirm: X 0-28200, Y 0-37400, pressure 0-8191
+# Confirm: pressure 0-8191, X/Y swap depending on --orientation
+#   landscape / inverted   → X 0-28200, Y 0-37400
+#   portrait_cw / portrait_ccw (default) → X 0-37400, Y 0-28200
 ```
 
 If the pen tracks correctly in evtest, it will work in any application
@@ -167,13 +186,57 @@ If the pen tracks correctly in evtest, it will work in any application
 ### Quick test (without installing)
 
 ```bash
-python3 huion_ble_driver.py
+python3 huion_ble_driver.py                          # default orientation (portrait_cw)
+python3 huion_ble_driver.py --orientation landscape  # native device frame
 ```
 
 ## Configuring the Tablet
 
+### Orientation
+
+The device's native coordinate frame is landscape (short edge horizontal), but
+the Note X10 is physically held in portrait for writing. The driver rotates raw
+coordinates before emitting them, so the OS and applications see the tablet in
+the orientation you actually hold it.
+
+| `--orientation` | Rotation | How to identify                                   |
+|-----------------|----------|---------------------------------------------------|
+| `landscape`     | 0°       | Native device frame — short edge on top/bottom   |
+| `portrait_cw`   | 270°     | Tablet held in portrait; default for the X10     |
+| `portrait_ccw`  | 90°      | Portrait, mirrored from `portrait_cw`            |
+| `inverted`      | 180°     | Tablet upside-down relative to native            |
+
+**To pick the right one**, run the driver and sweep the pen from the top edge
+down to the bottom edge of the tablet (as you hold it). The cursor should move
+top-to-bottom on screen. If it moves sideways or backwards, try another value
+until it tracks the pen correctly.
+
+```bash
+python3 huion_ble_driver.py --orientation portrait_ccw
+```
+
+**Systemd mode.** Two service files ship with the repo:
+
+- `huion-note-x10-portrait.service` → passes `--orientation portrait_cw`
+- `huion-note-x10-landscape.service` → passes `--orientation landscape`
+
+Install whichever matches your orientation (see [step 5](#5-install-the-driver)).
+For `portrait_ccw`, `inverted`, or a pinned `--mac`, override the `ExecStart`
+via `systemctl --user edit <unit>` — example in step 5.
+
+**Disable compositor-side rotation.** The driver owns rotation now; any
+compositor-level tablet rotation must be off:
+
+- Hyprland: `input:tablet:transform = 0` (or remove the line)
+- Sway / libinput calibration matrices: reset to identity
+
+If both the driver and the compositor rotate, the effects compound and the
+cursor will track the pen at the wrong angle.
+
+### Other input configuration
+
 This driver creates a standard Linux input device. Pressure curves, screen mapping,
-and active area configuration are handled by existing Linux tools:
+and active area are handled by existing Linux tools:
 
 - **[OpenTabletDriver](https://opentabletdriver.net/)** — GUI for pressure curves, area mapping, smoothing, and keybinding
 - **libinput / xinput** — command-line screen mapping:
@@ -264,13 +327,14 @@ See [`notes/journey.md`](notes/journey.md) for the full RE session log.
 ## Project Structure
 
 ```text
-huion_ble_driver.py             — BLE tablet driver (dbus_fast + uinput)
+huion_ble_driver.py                  — BLE tablet driver (dbus_fast + uinput)
 patches/
-  fix-duplicate-mtu-request.patch — BlueZ att.c patch for firmware MTU bug
-huion-note-x10.service          — systemd user service
-99-huion-note-x10.rules         — udev rules (uinput access + HOGP unbind)
-notes/journey.md                — Full RE session log
-Archives/                       — RE artifacts (Ghidra, captures, scripts)
+  fix-duplicate-mtu-request.patch    — BlueZ att.c patch for firmware MTU bug
+huion-note-x10-portrait.service      — systemd user service (portrait_cw)
+huion-note-x10-landscape.service     — systemd user service (landscape)
+99-huion-note-x10.rules              — udev rules (uinput access + HOGP unbind)
+notes/journey.md                     — Full RE session log
+Archives/                            — RE artifacts (Ghidra, captures, scripts)
 ```
 
 ## License

@@ -1,0 +1,13 @@
+[Unit]
+Description=Huion Note X10 BLE tablet driver (portrait)
+After=bluetooth.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/share/huion-note-x10/huion_ble_driver.py --orientation portrait_cw
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

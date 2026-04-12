@@ -56,9 +56,58 @@ TABLET_HANDSHAKE = [
 ]
 KEEPALIVE_INTERVAL = 5.0
 
-DEFAULT_MAX_X = 28200
-DEFAULT_MAX_Y = 37400
+# Fallback maxes; overridden at runtime by the cmd 0xC8 device-info response.
+# Values match what the X10 firmware self-reports in Pen Tablet Mode.
+DEFAULT_MAX_X = 37400
+DEFAULT_MAX_Y = 28200
 DEFAULT_MAX_PRESSURE = 8191
+
+# ─── Orientation ─────────────────────────────────────────────────────────────
+#
+# The device's native raw frame is landscape:
+#   raw X axis = long edge (37400), raw Y axis = short edge (28200).
+# Users hold the X10 in portrait, so the driver rotates raw (x,y) into an
+# output frame before emitting to uinput.
+#
+# Formulas mirror the macOS driver (RE'd from HuionTabletCore):
+#   _hn_pt_ratio_rotate{90,180,270}  — rotate a (0..1, 0..1) ratio
+#   _hn_angle_rotate{90,180,270}     — rotate a signed (tilt_x, tilt_y)
+
+ORIENTATION_LANDSCAPE    = "landscape"
+ORIENTATION_PORTRAIT_CCW = "portrait_ccw"   # 90°
+ORIENTATION_INVERTED     = "inverted"       # 180°
+ORIENTATION_PORTRAIT_CW  = "portrait_cw"    # 270°
+
+ORIENTATIONS = (ORIENTATION_LANDSCAPE, ORIENTATION_PORTRAIT_CCW,
+                ORIENTATION_INVERTED, ORIENTATION_PORTRAIT_CW)
+
+
+def rotate_ratio(nx: float, ny: float, orient: str) -> tuple[float, float]:
+    """Rotate a normalized pen position (nx, ny), each in [0, 1]."""
+    if orient == ORIENTATION_PORTRAIT_CCW:
+        return 1.0 - ny, nx
+    if orient == ORIENTATION_INVERTED:
+        return 1.0 - nx, 1.0 - ny
+    if orient == ORIENTATION_PORTRAIT_CW:
+        return ny, 1.0 - nx
+    return nx, ny
+
+
+def rotate_tilt(tx: int, ty: int, orient: str) -> tuple[int, int]:
+    """Rotate a signed tilt pair to match rotate_ratio."""
+    if orient == ORIENTATION_PORTRAIT_CCW:
+        tx, ty = ty, -tx
+    elif orient == ORIENTATION_INVERTED:
+        tx, ty = -tx, -ty
+    elif orient == ORIENTATION_PORTRAIT_CW:
+        tx, ty = -ty, tx
+    # Clamp to declared uinput range (−128 becomes +128 after negation)
+    return max(-127, min(127, tx)), max(-127, min(127, ty))
+
+
+def is_rotated_90(orient: str) -> bool:
+    return orient in (ORIENTATION_PORTRAIT_CW, ORIENTATION_PORTRAIT_CCW)
+
 
 # ─── Linux input constants ────────────────────────────────────────────────────
 
@@ -95,9 +144,11 @@ class UInputDevice:
             fcntl.ioctl(self.fd, UI_SET_EVBIT, ev)
         for btn in (BTN_TOUCH, BTN_TOOL_PEN, BTN_STYLUS):
             fcntl.ioctl(self.fd, UI_SET_KEYBIT, btn)
+        # res is in units/mm. The X10 firmware reports 5080 LPI (~200 u/mm)
+        # in the cmd 0xC8 handshake response.
         for code, min_val, max_val, res in [
-            (ABS_X, 0, self.max_x, 111),
-            (ABS_Y, 0, self.max_y, 111),
+            (ABS_X, 0, self.max_x, 200),
+            (ABS_Y, 0, self.max_y, 200),
             (ABS_PRESSURE, 0, self.max_pressure, 0),
             (ABS_TILT_X, -127, 127, 0),
             (ABS_TILT_Y, -127, 127, 0),
@@ -171,15 +222,17 @@ HYPRCTL = _resolve_hyprctl()
 
 
 class RegionMapper:
-    """Transforms raw tablet coordinates to map the full tablet surface onto
-    a sub-region of the screen (the Obsidian editor pane).
+    """Maps the full tablet surface onto a sub-region of the screen (the
+    Obsidian editor pane).
 
-    Accounts for Hyprland's input:tablet:transform = 3 (270° rotation):
-      - raw ABS_Y → screen X
-      - raw ABS_X (inverted) → screen Y
+    Operates in post-rotation output space: the driver has already rotated
+    raw device coords, so Hyprland sees a "normal" tablet and maps it with
+    transform=0 (no compositor-side rotation). This makes the transform a
+    direct linear remap.
     """
 
     def __init__(self, max_x: int, max_y: int):
+        # max_x/max_y are the post-rotation output extents advertised to uinput
         self.max_x = max_x
         self.max_y = max_y
         self.active = False
@@ -225,48 +278,37 @@ class RegionMapper:
         self.active = False
         log.info("Region mapping deactivated")
 
-    def transform(self, raw_x: int, raw_y: int) -> tuple[int, int]:
-        """Transform raw tablet coords so Hyprland (after 270° rotation)
-        places the pen inside the target screen region.
+    def transform(self, out_x: int, out_y: int) -> tuple[int, int]:
+        """Remap a post-rotation output coord so Hyprland (transform=0)
+        places the pen inside the target region.
 
-        With transform 3, Hyprland maps:
-          screen_x = monitor.x + (abs_y / max_y) * monitor.w
-          screen_y = monitor.y + (1 - abs_x / max_x) * monitor.h
-
-        We want the pen's full range [0..max] to land inside region:
-          target_x = region.x + norm_x * region.w
-          target_y = region.y + norm_y * region.h
-
-        where norm_x = raw_y / max_y, norm_y = 1 - raw_x / max_x
-        (physical pen position in portrait orientation).
-
-        Solving for the abs values to inject:
-          abs_y = max_y * (region.x - monitor.x + norm_x * region.w) / monitor.w
-          abs_x = max_x * (1 - (region.y - monitor.y + norm_y * region.h) / monitor.h)
+        Hyprland's linear map: screen = monitor.origin + (abs / max) * monitor.size.
+        We want the pen's full [0..max] range to land inside `region`:
+            screen = region.origin + (abs / max) * region.size
+        Solving for abs:
+            abs = max * (region.origin + (abs / max) * region.size - monitor.origin) / monitor.size
         """
         if not self._region or not self._monitor:
-            return raw_x, raw_y
+            return out_x, out_y
 
         r = self._region
         m = self._monitor
 
-        # Normalized pen position (0..1) in portrait orientation
-        norm_x = raw_y / self.max_y if self.max_y > 0 else 0
-        norm_y = 1.0 - (raw_x / self.max_x) if self.max_x > 0 else 0
+        # Normalized pen position across the full tablet, [0..1]
+        nx = out_x / self.max_x if self.max_x > 0 else 0
+        ny = out_y / self.max_y if self.max_y > 0 else 0
 
-        # Target screen position
-        target_sx = r["x"] + norm_x * r["width"]
-        target_sy = r["y"] + norm_y * r["height"]
+        # Target screen pixel inside the region
+        target_sx = r["x"] + nx * r["width"]
+        target_sy = r["y"] + ny * r["height"]
 
-        # Solve for abs values that produce this screen position after transform 3
-        abs_y = self.max_y * (target_sx - m["x"]) / m["width"] if m["width"] > 0 else 0
-        abs_x = self.max_x * (1.0 - (target_sy - m["y"]) / m["height"]) if m["height"] > 0 else 0
+        # Tablet coord that produces that screen pixel under Hyprland's linear map
+        new_x = self.max_x * (target_sx - m["x"]) / m["width"]  if m["width"]  > 0 else 0
+        new_y = self.max_y * (target_sy - m["y"]) / m["height"] if m["height"] > 0 else 0
 
-        # Clamp to valid range
-        abs_x = max(0, min(self.max_x, int(abs_x)))
-        abs_y = max(0, min(self.max_y, int(abs_y)))
-
-        return abs_x, abs_y
+        new_x = max(0, min(self.max_x, int(new_x)))
+        new_y = max(0, min(self.max_y, int(new_y)))
+        return new_x, new_y
 
 
 async def region_socket_client(mapper: RegionMapper, running_check,
@@ -606,12 +648,18 @@ class BLEConnection:
 # ─── Driver core ─────────────────────────────────────────────────────────────
 
 class HuionBLEDriver:
-    def __init__(self, mac: str):
+    def __init__(self, mac: str, orientation: str = ORIENTATION_PORTRAIT_CW):
         self.ble = BLEConnection(mac)
         self.uinput: UInputDevice | None = None
-        self.max_x = DEFAULT_MAX_X
-        self.max_y = DEFAULT_MAX_Y
+        self.orientation = orientation
+        # Raw = what the device sends. Output = post-rotation, advertised to uinput.
+        self.raw_max_x = DEFAULT_MAX_X
+        self.raw_max_y = DEFAULT_MAX_Y
         self.max_pressure = DEFAULT_MAX_PRESSURE
+        if is_rotated_90(orientation):
+            self.max_x, self.max_y = self.raw_max_y, self.raw_max_x
+        else:
+            self.max_x, self.max_y = self.raw_max_x, self.raw_max_y
         self.device_name = "unknown"
         self._running = True
         self._disconnect_event = asyncio.Event()
@@ -622,6 +670,9 @@ class HuionBLEDriver:
                        "raw_x_min": None, "raw_x_max": None,
                        "raw_y_min": None, "raw_y_max": None}
         self.region_mapper = RegionMapper(self.max_x, self.max_y)
+        log.info("Orientation: %s (raw %dx%d → output %dx%d)",
+                 orientation, self.raw_max_x, self.raw_max_y,
+                 self.max_x, self.max_y)
         log.info("hyprctl resolved to: %s",
                  HYPRCTL or "(not found — monitor switching disabled)")
 
@@ -641,35 +692,46 @@ class HuionBLEDriver:
             self._emit_pen(x, y, pressure if pen_touching else 0, tilt_x, tilt_y)
             return
 
-        # Not pen data — treat as command response
-        if len(data) >= 2:
-            if data[0] == MARKER_START and len(data) >= 3:
-                cmd_id = data[1]
-                payload = data[3:] if len(data) > 3 else b""
-                self._handshake_responses[cmd_id] = payload
-                log.info("RESP 0x%02x (%d bytes): %s", cmd_id, len(data), data.hex())
-            else:
-                self._handshake_responses[data[0]] = data[1:]
-                log.info("DATA 0x%02x (%d bytes): %s", data[0], len(data), data.hex())
+        # Not pen data — parse as Pen Tablet Mode command response.
+        # BLE RX framing is [LEN, CMD_ID, payload...] where LEN == len(frame).
+        # (The 0xCD MARKER_START byte only appears on TX, not RX.)
+        if len(data) >= 2 and data[0] == len(data):
+            cmd_id = data[1]
+            payload = data[2:]
+            self._handshake_responses[cmd_id] = payload
+            log.info("RESP 0x%02x (%d bytes): %s", cmd_id, len(data), data.hex())
+        elif len(data) >= 1:
+            log.debug("Unknown frame (%d bytes): %s", len(data), data.hex())
 
-    def _emit_pen(self, x: int, y: int, pressure: int, tilt_x: int = 0, tilt_y: int = 0):
-        """Emit pen data to uinput."""
-        # Track raw input range (pre-transform) for calibration diagnostics
+    def _emit_pen(self, raw_x: int, raw_y: int, pressure: int,
+                  tilt_x: int = 0, tilt_y: int = 0):
+        """Rotate raw device coords into output space and emit to uinput."""
+        # Track raw input range (pre-rotation) for calibration diagnostics
         s = self._stats
-        if s["raw_x_min"] is None or x < s["raw_x_min"]: s["raw_x_min"] = x
-        if s["raw_x_max"] is None or x > s["raw_x_max"]: s["raw_x_max"] = x
-        if s["raw_y_min"] is None or y < s["raw_y_min"]: s["raw_y_min"] = y
-        if s["raw_y_max"] is None or y > s["raw_y_max"]: s["raw_y_max"] = y
+        if s["raw_x_min"] is None or raw_x < s["raw_x_min"]: s["raw_x_min"] = raw_x
+        if s["raw_x_max"] is None or raw_x > s["raw_x_max"]: s["raw_x_max"] = raw_x
+        if s["raw_y_min"] is None or raw_y < s["raw_y_min"]: s["raw_y_min"] = raw_y
+        if s["raw_y_max"] is None or raw_y > s["raw_y_max"]: s["raw_y_max"] = raw_y
+
+        # Rotate raw → output: normalize in raw frame, rotate ratio, denormalize
+        # in output frame. Matches macOS HnCoordMap::cRatioInRawCoord path.
+        nx = raw_x / self.raw_max_x if self.raw_max_x > 0 else 0
+        ny = raw_y / self.raw_max_y if self.raw_max_y > 0 else 0
+        nx, ny = rotate_ratio(nx, ny, self.orientation)
+        out_x = int(nx * self.max_x)
+        out_y = int(ny * self.max_y)
+        tilt_x, tilt_y = rotate_tilt(tilt_x, tilt_y, self.orientation)
 
         if not self.uinput or self.uinput.fd < 0:
-            log.info("PEN: x=%d y=%d p=%d tx=%d ty=%d", x, y, pressure, tilt_x, tilt_y)
+            log.info("PEN: x=%d y=%d p=%d tx=%d ty=%d",
+                     out_x, out_y, pressure, tilt_x, tilt_y)
             return
-        # Apply region mapping if active
+
         if self.region_mapper.active:
-            x, y = self.region_mapper.transform(x, y)
-        pen_active = pressure > 0 or x > 0 or y > 0
+            out_x, out_y = self.region_mapper.transform(out_x, out_y)
+        pen_active = pressure > 0 or out_x > 0 or out_y > 0
         if pen_active:
-            self.uinput.report(x, y, pressure, True, tilt_x, tilt_y)
+            self.uinput.report(out_x, out_y, pressure, True, tilt_x, tilt_y)
             self._pen_was_active = True
         elif self._pen_was_active:
             self.uinput.pen_up()
@@ -682,7 +744,8 @@ class HuionBLEDriver:
     # ── Connection + handshake ──
 
     async def _send_handshake(self) -> bool:
-        """Send handshake commands via D-Bus WriteValue."""
+        """Send handshake commands and adopt the device's self-reported
+        capabilities from the cmd 0xC8 response."""
         log.info("Sending handshake...")
         for i, cmd in enumerate(TABLET_HANDSHAKE):
             if not await self.ble.write_cmd(cmd):
@@ -690,6 +753,32 @@ class HuionBLEDriver:
                 return False
             log.debug("  cmd %d: %s", i + 1, cmd.hex())
             await asyncio.sleep(0.15)
+
+        # Grace period for the final response to arrive on FFE2 indications
+        await asyncio.sleep(0.3)
+
+        name_payload = self._handshake_responses.get(CMD_TABLET_NAME)
+        if name_payload:
+            self.device_name = parse_tablet_device_name(name_payload)
+
+        info_payload = self._handshake_responses.get(CMD_TABLET_INFO)
+        if info_payload:
+            info = parse_tablet_device_info(info_payload)
+            self.raw_max_x = info["max_x"]
+            self.raw_max_y = info["max_y"]
+            self.max_pressure = info["max_pressure"]
+            if is_rotated_90(self.orientation):
+                self.max_x, self.max_y = self.raw_max_y, self.raw_max_x
+            else:
+                self.max_x, self.max_y = self.raw_max_x, self.raw_max_y
+            self.region_mapper.max_x = self.max_x
+            self.region_mapper.max_y = self.max_y
+            log.info("Device info: max_x=%d max_y=%d max_p=%d lpi=%d → output %dx%d",
+                     info["max_x"], info["max_y"], info["max_pressure"], info["lpi"],
+                     self.max_x, self.max_y)
+        else:
+            log.warning("No device-info response; using fallback maxes "
+                        "(raw %dx%d)", self.raw_max_x, self.raw_max_y)
         return True
 
     async def _connect_and_handshake(self) -> bool:
@@ -842,11 +931,12 @@ class HuionBLEDriver:
             log.error("Cannot open /dev/uinput: %s", e)
             return
 
-        print(f"  Device:   {self.device_name}")
-        print(f"  MAC:      {self.ble.mac}")
-        print(f"  Max X:    {self.max_x}")
-        print(f"  Max Y:    {self.max_y}")
-        print(f"  Pressure: {self.max_pressure} levels")
+        print(f"  Device:      {self.device_name}")
+        print(f"  MAC:         {self.ble.mac}")
+        print(f"  Orientation: {self.orientation}")
+        print(f"  Output X:    0..{self.max_x}")
+        print(f"  Output Y:    0..{self.max_y}")
+        print(f"  Pressure:    {self.max_pressure} levels")
         print(f"\n  Driver active — move the pen!")
         print(f"  If no pen data, close and reopen the tablet cover.\n")
 
@@ -873,7 +963,7 @@ class HuionBLEDriver:
                 log.info("samples=%d (%.0f/s), reconnects=%d, "
                          "raw_x=%s/%d raw_y=%s/%d",
                          s["samples"], rate, s["reconnects"],
-                         rx, self.max_x, ry, self.max_y)
+                         rx, self.raw_max_x, ry, self.raw_max_y)
                 total_samples += s["samples"]
                 s["samples"] = 0
                 s["raw_x_min"] = s["raw_x_max"] = None
@@ -937,6 +1027,10 @@ async def main():
     parser = argparse.ArgumentParser(description="Huion Note X10 BLE driver")
     parser.add_argument("--mac",
                         help="BLE MAC address (auto-detected if omitted)")
+    parser.add_argument("--orientation", default=ORIENTATION_PORTRAIT_CW,
+                        choices=ORIENTATIONS,
+                        help="Tablet physical orientation "
+                             "(default: portrait_cw — top-of-tablet on the right)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Enable debug logging")
     args = parser.parse_args()
@@ -953,7 +1047,7 @@ async def main():
             return
         log.info("Auto-detected tablet: %s", mac)
 
-    driver = HuionBLEDriver(mac)
+    driver = HuionBLEDriver(mac, orientation=args.orientation)
 
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
