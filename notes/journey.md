@@ -1493,3 +1493,86 @@ Patch file: `modules/huion/patches/fix-duplicate-mtu-request.patch` (6 lines cha
 | HOGP coexistence | Working — HOGP no longer causes disconnects |
 | Reconnect after cover close | Working — auto-recovers via session loop |
 | BlueZ patch | 2-line change, NixOS overlay, zero maintenance burden |
+
+---
+
+## 2026-04-14: Hardware Button Investigation — Dead End (For Now)
+
+### Goal
+
+Capture and dispatch the single physical hardware button on the Note X10 case.
+The Mac driver's Ghidra output shows button frames as `55 54 0xE0/0xE2 …` on FFE1
+(per `HnDoerHkey::handle()`), gated by `hkey_num > 0` in the `0xC8` response.
+
+### What we confirmed
+
+1. **Device firmware reports `hkey=1`** in the `0xC8` capability struct
+   (parse_cmd_resp_200 offset +11). One hardware button exists.
+2. **Full GATT enumeration via `bluetoothctl menu gatt`** lists every service:
+   - Standard: `0x1800` GAP, `0x1801` GATT, `0x180A` Device Info,
+     `0x180F` Battery, **`0x1812` HID** (with Report Map, Report, Protocol Mode,
+     HID Info, HID Control Point), plus the proprietary `0xFFE0` (FFE1/FFE2)
+     and an opaque `00010203-0405-0607-0809-…1912` vendor service.
+   - The `0x1812` Report Map at `char001a` is a **standard USB boot keyboard
+     descriptor** (Report ID 1, 1 reserved + 8 modifier bits + 6 keycode array).
+   - No second `/dev/input/eventN` or `/dev/hidrawN` is bound by the kernel for
+     this BLE MAC — BlueZ patch + AcquireNotify race wins, kernel HID stays out.
+
+### What we tried, what we observed
+
+Ran the driver with extra diagnostic instrumentation:
+- `StartNotify` on HID Report (`char0016`, UUID `0x2a4d`) → CCCD write succeeded
+  (`Notifying: yes`), but **zero notifications** arrived during 35+ s captures
+  with deliberate button presses.
+- `_on_notification` extra branch logging any FFE1 `55 54 Ex` frame as
+  `FFE1 HBTN/TOUCH/MCKEY/SPECIAL/TYPE_0xXX` → also **zero** non-pen,
+  non-`0x00`-pen-leave frames during button presses.
+- Pen data continued to flow normally throughout (≈20-200 samples/s).
+- The periodic `0xD1` battery heartbeat (`06 d1 64 43 00 00`) every ~5 s is the
+  only spontaneous traffic on FFE2.
+
+### Why this matters
+
+Both candidate transports were instrumented and silent during button presses:
+- HID-over-GATT keyboard channel (`char0016`): subscribed, never fires.
+- Vendor FFE1 `0xE0+` report types: handled, never fires.
+
+The Mac driver's `verify_str_202` (cmd `0xCA`) authentication step is the only
+remaining unaccounted-for handshake item — `0xC9` and `0xC8` get clean responses
+on FFE2 indicate, but `0xCA` is silently dropped or ignored. That may be a red
+herring (pen works fine without it) or it may gate button event emission on
+this specific firmware/host combination.
+
+### What's still open
+
+1. **Android HCI snoop capture with the official Huion Note app** —
+   the definitive ground truth. Capture the app↔tablet session, press the
+   button, find which characteristic+handle the button frame lands on, and
+   diff the TX command sequence against ours. The user's Android device is
+   available for this; the procedure was tried previously for pen data
+   (see `2026-04-XX: Phase 6` section above) and it worked.
+2. **`0xCA` authentication** — the response is ~68 bytes (UTF-16 manufacturer
+   string + 0xBEF checksum), which exceeds a single MTU-141 frame. Possible
+   the response is fragmented and our framing assumption silently drops it.
+3. **Whether the button is BLE-only or also exposed via the IR/USB-C path** —
+   the Note X10 has both; possible the button is firmware-routed to a path
+   that BLE never sees, regardless of mode.
+
+### Code outcome
+
+Reverted the diagnostic plumbing (HID Report subscription, FFE1 `0xE0+` log
+branches) — they added wire activity and log noise without producing
+information. **Kept** the byproduct correctness fixes:
+- `parse_tablet_pen_report` now requires byte[2] in `(0x00, 0x80, 0x81)`.
+  Prevents any future `55 54 Ex` frame from being mis-decoded as garbage
+  pen coords.
+- `0x00` status frames (pen-leave / out-of-proximity) trigger explicit
+  `pen_up()` instead of phantom hover at stale coords. Eliminates lift
+  jitter.
+- `parse_tablet_device_info` now extracts and logs `pen_btn_num`, `hkey_num`,
+  `skey_num` from the `0xC8` response. Diagnostic visibility for next
+  attempt.
+
+If/when buttons are revisited: start with the Android HCI snoop capture.
+Don't reimplement the HID Report subscription without ground-truth packet
+evidence that the channel actually fires.

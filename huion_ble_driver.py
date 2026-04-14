@@ -383,6 +383,11 @@ def parse_tablet_pen_report(data: bytes) -> tuple | None:
     """
     if len(data) < 13 or data[0] != 0x55 or data[1] != 0x54:
         return None
+    # byte[2] is a report-type discriminator (per Ghidra: < 0x91 = pen,
+    # 0xA0 = special, 0xE0/0xE2 = buttons, 0xE1 = touch, 0xE3 = multi-click).
+    # 0x00 = pen-leave (stale coords + zero pressure), 0x80 = hover, 0x81 = touch.
+    if data[2] not in (0x00, 0x80, 0x81):
+        return None
 
     status = data[2]
     x = data[3] | (data[4] << 8) | (data[9] << 16)
@@ -401,7 +406,8 @@ def parse_tablet_device_info(data: bytes) -> dict:
       [6-7] max_P (16-bit LE)   [8-9] LPI (16-bit LE)
     """
     info = {"max_x": DEFAULT_MAX_X, "max_y": DEFAULT_MAX_Y,
-            "max_pressure": DEFAULT_MAX_PRESSURE, "lpi": 0}
+            "max_pressure": DEFAULT_MAX_PRESSURE, "lpi": 0,
+            "pen_btn_num": 0, "hkey_num": 0, "skey_num": 0}
     if len(data) < 8:
         return info
     info["max_x"] = data[0] | (data[1] << 8) | (data[2] << 16)
@@ -409,6 +415,11 @@ def parse_tablet_device_info(data: bytes) -> dict:
     info["max_pressure"] = struct.unpack_from("<H", data, 6)[0]
     if len(data) >= 10:
         info["lpi"] = struct.unpack_from("<H", data, 8)[0]
+    # Offsets from Ghidra _parse_cmd_resp_200: pen_btn (10), hkey (11), skey (12).
+    # hkey_num > 0 is the Mac driver's gate for dispatching 0xE0/0xE2 button frames.
+    if len(data) >= 11: info["pen_btn_num"] = data[10]
+    if len(data) >= 12: info["hkey_num"] = data[11]
+    if len(data) >= 13: info["skey_num"] = data[12]
     return info
 
 
@@ -687,6 +698,12 @@ class HuionBLEDriver:
         report = parse_tablet_pen_report(data)
         if report is not None:
             status, x, y, pressure, tilt_x, tilt_y = report
+            if status == 0x00:
+                # Pen left proximity — coords are stale, skip them and lift.
+                if self._pen_was_active and self.uinput:
+                    self.uinput.pen_up()
+                    self._pen_was_active = False
+                return
             # Status: 0x80 = hovering (pen near surface), 0x81 = touching
             pen_touching = (status & 0x01) != 0
             self._emit_pen(x, y, pressure if pen_touching else 0, tilt_x, tilt_y)
@@ -776,6 +793,9 @@ class HuionBLEDriver:
             log.info("Device info: max_x=%d max_y=%d max_p=%d lpi=%d → output %dx%d",
                      info["max_x"], info["max_y"], info["max_pressure"], info["lpi"],
                      self.max_x, self.max_y)
+            log.info("Button counts: pen_btn=%d hkey=%d skey=%d "
+                     "(hkey>0 is firmware's gate for 0xE0/0xE2 frames on FFE1)",
+                     info["pen_btn_num"], info["hkey_num"], info["skey_num"])
         else:
             log.warning("No device-info response; using fallback maxes "
                         "(raw %dx%d)", self.raw_max_x, self.raw_max_y)
