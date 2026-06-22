@@ -2,12 +2,17 @@
 Description=Huion Note X10 BLE tablet driver (portrait)
 After=bluetooth.target
 Wants=bluetooth.target
+# Retry forever so the driver connects whenever the tablet is turned on. The
+# driver exits 0 when no tablet is found, so Restart=always (not on-failure) is
+# required; StartLimitIntervalSec=0 disables the restart rate-limit so systemd
+# never gives up while the tablet is simply off.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 %h/.local/share/huion-note-x10/huion_ble_driver.py --orientation portrait_cw
-Restart=on-failure
-RestartSec=3
+Restart=always
+RestartSec=10
 
 [Install]
 WantedBy=default.target
