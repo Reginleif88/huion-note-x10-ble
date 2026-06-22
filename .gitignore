@@ -1,9 +1,13 @@
 # Proprietary binaries and derived RE output
 Archives/
 
+notes-out/
+.superpowers
+
 # Python
 __pycache__/
 *.pyc
+.venv/
 
 # Ghidra
 *.gpr
@@ -13,3 +17,13 @@ __pycache__/
 # Editor
 *.swp
 *~
+
+# Offline-note extraction: raw captures contain personal handwriting and
+# possibly replayable tokens — never commit. Decompiled app too.
+captures/
+apk/
+*.btsnoop
+*.log
+bugreport*.zip
+decoded*.svg
+decoded*.png
