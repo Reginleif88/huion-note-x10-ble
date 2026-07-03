@@ -7,6 +7,7 @@ import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.content.Context
 import android.os.Build
 import android.util.Log
@@ -34,6 +35,9 @@ class GattTransport(private val context: Context, private val device: BluetoothD
     private val writeMutex = Mutex()
     private var gatt: BluetoothGatt? = null
     private var cmdChar: BluetoothGattCharacteristic? = null
+    // Completed from onCharacteristicWrite with the GATT status of the in-flight write.
+    // Guarded by writeMutex: only one write is ever outstanding at a time.
+    private var pendingWrite: CompletableDeferred<Int>? = null
 
     private val callback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
@@ -96,6 +100,11 @@ class GattTransport(private val context: Context, private val device: BluetoothD
         override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
             inbox.trySend(value.copyOf())
         }
+
+        override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
+            // Fires even for WRITE_TYPE_NO_RESPONSE writes once the stack accepts the buffer.
+            pendingWrite?.complete(status)
+        }
     }
 
     private fun writeCccd(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
@@ -128,14 +137,31 @@ class GattTransport(private val context: Context, private val device: BluetoothD
         val g = gatt ?: throw TransportClosed("not connected")
         val c = cmdChar ?: throw TransportClosed("no command characteristic")
         writeMutex.withLock {
-            if (Build.VERSION.SDK_INT >= 33) {
-                g.writeCharacteristic(c, frame, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
-            } else {
-                @Suppress("DEPRECATION")
-                c.value = frame
-                c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                @Suppress("DEPRECATION")
-                g.writeCharacteristic(c)
+            val deferred = CompletableDeferred<Int>()
+            pendingWrite = deferred
+            try {
+                // Issue the write and check the immediate result: a rejected write never
+                // produces an onCharacteristicWrite callback, so we must fail here.
+                val accepted = if (Build.VERSION.SDK_INT >= 33) {
+                    g.writeCharacteristic(c, frame, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) ==
+                        BluetoothStatusCodes.SUCCESS
+                } else {
+                    @Suppress("DEPRECATION")
+                    c.value = frame
+                    c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                    @Suppress("DEPRECATION")
+                    g.writeCharacteristic(c)
+                }
+                if (!accepted) throw TransportClosed("write rejected by GATT stack")
+                // Wait for the stack to confirm it accepted the buffer, so back-to-back
+                // writes aren't silently dropped. Timeout -> treat the link as dead.
+                val status = withTimeoutOrNull(5_000) { deferred.await() }
+                    ?: throw TransportClosed("write timed out")
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    throw TransportClosed("write failed (status=$status)")
+                }
+            } finally {
+                pendingWrite = null
             }
         }
     }
