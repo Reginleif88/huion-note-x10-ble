@@ -145,10 +145,10 @@ private fun GalleryScreen(
                     enabled = SyncRepository.canDeleteOnTablet(),
                     onClick = {
                         // spec: incomplete pages are excluded from tablet-delete
-                        val indices = selected.mapNotNull { store.get(it) }
-                            .filter { it.complete }.map { it.sourceIndex }
+                        val stems = selected.mapNotNull { store.get(it) }
+                            .filter { it.complete }.map { it.stem }
                         selected = setOf()
-                        if (indices.isNotEmpty()) SyncService.deleteOnTablet(context, indices)
+                        if (stems.isNotEmpty()) SyncService.deleteOnTablet(context, stems)
                         else SyncRepository.notify("selected pages are incomplete — not deleting on tablet")
                     },
                 ) { Text("Delete on tablet") }
@@ -234,7 +234,7 @@ private fun ViewerScreen(store: PageStore, stem: String, onBack: () -> Unit) {
             OutlinedButton(
                 // spec: incomplete pages are excluded from tablet-delete
                 enabled = syncState is SyncState.Connected && page.complete,
-                onClick = { SyncService.deleteOnTablet(context, listOf(page.sourceIndex)) },
+                onClick = { SyncService.deleteOnTablet(context, listOf(page.stem)) },
             ) { Text("Delete on tablet") }
             Spacer(Modifier.width(8.dp))
             OutlinedButton(onClick = { store.deleteLocal(stem); SyncRepository.bumpPages(); onBack() }) {
@@ -295,7 +295,9 @@ private suspend fun uploadPages(
     }
     val uploader = Uploader()
     var ok = 0
-    val uploadedIndices = mutableListOf<Int>()
+    // Only complete pages are eligible for tablet-delete: deleting an incomplete page
+    // would destroy the tablet's only full copy (spec: incomplete-page exclusion).
+    val deletableStems = mutableListOf<String>()
     withContext(Dispatchers.IO) {
         for (stem in stems) {
             val p = store.get(stem) ?: continue
@@ -305,14 +307,14 @@ private suspend fun uploadPages(
             )
             if (success) {
                 store.markUploaded(stem)
-                uploadedIndices += p.sourceIndex
                 ok += 1
+                if (p.complete) deletableStems += stem
             }
         }
     }
     SyncRepository.bumpPages()
     SyncRepository.notify("uploaded $ok/${stems.size} page(s)")
-    if (settings.deleteAfterUpload && uploadedIndices.isNotEmpty() && SyncRepository.canDeleteOnTablet()) {
-        SyncService.deleteOnTablet(context, uploadedIndices)
+    if (settings.deleteAfterUpload && deletableStems.isNotEmpty() && SyncRepository.canDeleteOnTablet()) {
+        SyncService.deleteOnTablet(context, deletableStems)
     }
 }

@@ -12,6 +12,7 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -41,6 +42,9 @@ class SyncService : Service() {
     private var engine: SyncEngine? = null
     private var idleJob: Job? = null
     private var syncJob: Job? = null
+    // The syncedAt stamp of the most recent successful sync. Tablet-delete requests
+    // that resolve to pages from any older sync are refused (their sourceIndex is stale).
+    private var lastSyncedAt: Long = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -50,14 +54,30 @@ class SyncService : Service() {
                 if (syncJob?.isActive == true) {
                     SyncRepository.notify("sync already running")
                 } else {
-                    syncJob = scope.launch { runSync() }
+                    syncJob = scope.launch {
+                        // A prior sync may have left a live GATT session (state Connected).
+                        // Close it before opening a new one so the old transport is never
+                        // leaked or overwritten by the fresh attempt below.
+                        if (transport != null) {
+                            idleJob?.cancel()
+                            try { transport?.close() } catch (e: Exception) { /* already gone */ }
+                            transport = null
+                            engine = null
+                        }
+                        runSync()
+                    }
                 }
             }
             ACTION_DELETE -> {
-                val indices = intent.getIntArrayExtra(EXTRA_INDICES) ?: intArrayOf()
-                scope.launch { runDelete(indices.toList()) }
+                val stems = intent.getStringArrayExtra(EXTRA_STEMS)?.toList() ?: emptyList()
+                scope.launch { runDelete(stems) }
             }
-            ACTION_DISCONNECT -> scope.launch { teardown(SyncState.Idle) }
+            ACTION_DISCONNECT -> {
+                // Cancel the sync coroutine first so its automatic-retry logic can't
+                // reconnect after the user has explicitly asked to disconnect.
+                syncJob?.cancel()
+                scope.launch { teardown(SyncState.Idle) }
+            }
         }
         return START_NOT_STICKY
     }
@@ -105,6 +125,7 @@ class SyncService : Service() {
                 done = 0
                 attempt()
             }
+            lastSyncedAt = syncedAt   // this session's pages are now the only delete-eligible set
             SyncRepository.state.value = SyncState.Connected
             SyncRepository.notify("synced $done page(s)")
             scheduleIdleDisconnect()
@@ -116,12 +137,16 @@ class SyncService : Service() {
             teardown(SyncState.Error("connection lost: ${e.message}"))
         } catch (e: FrameTimeout) {
             teardown(SyncState.Error("device stopped responding"))
+        } catch (e: CancellationException) {
+            // User-requested disconnect (or service teardown): don't swallow it as a
+            // generic failure — let cancellation propagate so no error state is published.
+            throw e
         } catch (e: Exception) {
             teardown(SyncState.Error("sync failed: ${e.message}"))
         }
     }
 
-    private suspend fun runDelete(indices: List<Int>) {
+    private suspend fun runDelete(stems: List<String>) {
         val e = engine
         val t = transport
         if (e == null || t == null || SyncRepository.state.value != SyncState.Connected) {
@@ -129,6 +154,22 @@ class SyncService : Service() {
             return
         }
         scheduleIdleDisconnect() // reset the idle timer
+        // Resolve stems -> stored pages. sourceIndex is only meaningful for pages from THIS
+        // session's sync: an older sync's index may now point at a different tablet page.
+        // Drop anything synced before this session, then require completeness, dedup, and
+        // delete highest-index-first so surviving indices can't shift under us.
+        val store = PageStore(filesDir)
+        val resolved = stems.mapNotNull { store.get(it) }
+        val stale = resolved.filter { it.syncedAt != lastSyncedAt }
+        if (stale.isNotEmpty()) {
+            SyncRepository.notify("${stale.size} page(s) skipped: synced before this session")
+        }
+        val indices = resolved
+            .filter { it.syncedAt == lastSyncedAt && it.complete }
+            .map { it.sourceIndex }
+            .distinct()
+            .sortedDescending()               // descending: indices can't shift
+        if (indices.isEmpty()) return
         // Guardrail: refuse if the tablet created pages since the sync (NEXT_PAGE seen).
         // Bounded by a wall-clock deadline rather than a full second of silence, so
         // sub-second device chatter can't make this drain hang forever.
@@ -144,7 +185,7 @@ class SyncService : Service() {
         }
         var ok = 0
         try {
-            for (idx in indices.sortedDescending()) {       // descending: indices can't shift
+            for (idx in indices) {
                 if (e.deletePage(idx)) ok += 1
             }
         } catch (ex: TransportClosed) {
@@ -152,6 +193,9 @@ class SyncService : Service() {
             return
         }
         SyncRepository.notify("deleted $ok/${indices.size} page(s) on tablet")
+        // After any confirmed delete the tablet's page set has shifted: force a fresh sync
+        // before further tablet-deletes so no now-stale sourceIndex stays usable.
+        if (ok >= 1) teardown(SyncState.Idle)
     }
 
     private suspend fun teardown(finalState: SyncState) {
@@ -216,14 +260,14 @@ class SyncService : Service() {
         const val ACTION_SYNC = "xyz.reginleif.hinotesync.SYNC"
         const val ACTION_DELETE = "xyz.reginleif.hinotesync.DELETE"
         const val ACTION_DISCONNECT = "xyz.reginleif.hinotesync.DISCONNECT"
-        const val EXTRA_INDICES = "indices"
+        const val EXTRA_STEMS = "stems"
 
         fun sync(context: Context) = ContextCompat.startForegroundService(
             context, Intent(context, SyncService::class.java).setAction(ACTION_SYNC))
 
-        fun deleteOnTablet(context: Context, indices: List<Int>) = context.startService(
+        fun deleteOnTablet(context: Context, stems: List<String>) = context.startService(
             Intent(context, SyncService::class.java).setAction(ACTION_DELETE)
-                .putExtra(EXTRA_INDICES, indices.toIntArray()))
+                .putExtra(EXTRA_STEMS, stems.toTypedArray()))
 
         fun disconnect(context: Context) = context.startService(
             Intent(context, SyncService::class.java).setAction(ACTION_DISCONNECT))
