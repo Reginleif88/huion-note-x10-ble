@@ -10,6 +10,10 @@ and can delete synced pages from the tablet. No Huion app, no cloud.
     ./gradlew :app:assembleDebug      # needs ANDROID_HOME + JDK 17
     ./gradlew :app:installDebug       # phone in USB-debugging mode
 
+On NixOS, `shell.nix` in this directory provides the whole toolchain:
+
+    nix-shell shell.nix --run 'cd android && ./gradlew :app:assembleDebug'
+
 ## Use
 
 1. Settings → set your server URL (and optional auth header).
