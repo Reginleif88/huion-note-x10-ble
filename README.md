@@ -267,6 +267,7 @@ keyboard (pen data is on vendor FFE0, not HID).
 ```text
 huion_ble_driver.py        — live pen/tablet driver (dbus_fast + uinput)
 huion_notes/               — offline note extractor package (frames/auth/codec/render/session/transport/cli)
+android/                   — HiNote Sync — native Android app: sync pages over BLE, upload PNG+JSON, delete on tablet
 huion-x10-notes.sh         — launcher for the extractor (handles dbus_fast / Nix)
 patches/                   — BlueZ att.c patch for the firmware MTU bug
 *.service, *.rules         — systemd user services + udev rules (driver)
