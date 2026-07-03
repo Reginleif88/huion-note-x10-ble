@@ -55,14 +55,18 @@ class PageStore(private val baseDir: File) {
     private fun read(dir: File): StoredPage? {
         val metaFile = File(dir, "meta.json")
         if (!metaFile.isFile) return null
-        val meta = JSONObject(metaFile.readText())
-        return StoredPage(
-            stem = dir.name,
-            dir = dir,
-            sourceIndex = meta.getInt("sourceIndex"),
-            syncedAt = meta.getLong("syncedAt"),
-            uploaded = meta.optBoolean("uploaded", false),
-            complete = meta.optBoolean("complete", true),
-        )
+        return try {
+            val meta = JSONObject(metaFile.readText())
+            StoredPage(
+                stem = dir.name,
+                dir = dir,
+                sourceIndex = meta.getInt("sourceIndex"),
+                syncedAt = meta.getLong("syncedAt"),
+                uploaded = meta.optBoolean("uploaded", false),
+                complete = meta.optBoolean("complete", true),
+            )
+        } catch (e: org.json.JSONException) {
+            null
+        }
     }
 }

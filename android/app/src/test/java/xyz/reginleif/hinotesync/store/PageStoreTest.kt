@@ -10,6 +10,7 @@ import org.junit.rules.TemporaryFolder
 import xyz.reginleif.hinotesync.protocol.Limits
 import xyz.reginleif.hinotesync.protocol.PageData
 import xyz.reginleif.hinotesync.protocol.StylusPoint
+import java.io.File
 
 class PageStoreTest {
     @get:Rule val tmp = TemporaryFolder()
@@ -54,5 +55,19 @@ class PageStoreTest {
         store.deleteLocal(sp.stem)
         assertNull(store.get(sp.stem))
         assertTrue(store.list().isEmpty())
+    }
+
+    @Test fun listSkipsCorruptMetaJson() {
+        val store = PageStore(tmp.root)
+        val valid = store.save(page(0), byteArrayOf(1), 1000L)
+        val corrupt = store.save(page(1), byteArrayOf(2), 2000L)
+        // Corrupt the second page's meta.json
+        File(corrupt.dir, "meta.json").writeText("{not json")
+        // list() should return only the valid page
+        val listed = store.list()
+        assertEquals(1, listed.size)
+        assertEquals(valid.stem, listed.single().stem)
+        // get() should return null for the corrupt stem
+        assertNull(store.get(corrupt.stem))
     }
 }
