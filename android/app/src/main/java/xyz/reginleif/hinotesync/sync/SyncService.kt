@@ -48,7 +48,7 @@ class SyncService : Service() {
         when (intent?.action) {
             ACTION_SYNC -> {
                 if (syncJob?.isActive == true) {
-                    SyncRepository.message.value = "sync already running"
+                    SyncRepository.notify("sync already running")
                 } else {
                     syncJob = scope.launch { runSync() }
                 }
@@ -90,8 +90,8 @@ class SyncService : Service() {
                     done += 1
                     SyncRepository.state.value = SyncState.Syncing(done)
                     SyncRepository.bumpPages()
-                    if (!page.complete) SyncRepository.message.value =
-                        "page ${page.index} incomplete (packets missing) — kept anyway"
+                    if (!page.complete) SyncRepository.notify(
+                        "page ${page.index} incomplete (packets missing) — kept anyway")
                 }
             }
 
@@ -100,13 +100,13 @@ class SyncService : Service() {
             } catch (e: TransportClosed) {
                 // spec: mid-transfer drop -> reconnect, re-handshake, resume (one automatic retry;
                 // the dump restarts from page 0, re-saved pages overwrite, 0x88 covers packet loss)
-                SyncRepository.message.value = "connection dropped — reconnecting…"
+                SyncRepository.notify("connection dropped — reconnecting…")
                 try { transport?.close() } catch (ex: Exception) { /* already gone */ }
                 done = 0
                 attempt()
             }
             SyncRepository.state.value = SyncState.Connected
-            SyncRepository.message.value = "synced $done page(s)"
+            SyncRepository.notify("synced $done page(s)")
             scheduleIdleDisconnect()
         } catch (e: PinRequired) {
             teardown(SyncState.Error("device requires a PIN — set it in Settings"))
@@ -125,7 +125,7 @@ class SyncService : Service() {
         val e = engine
         val t = transport
         if (e == null || t == null || SyncRepository.state.value != SyncState.Connected) {
-            SyncRepository.message.value = "not connected — sync first, then delete"
+            SyncRepository.notify("not connected — sync first, then delete")
             return
         }
         scheduleIdleDisconnect() // reset the idle timer
@@ -138,7 +138,7 @@ class SyncService : Service() {
                 teardown(SyncState.Error("connection lost")); return
             }
             if (parseHuionFrame(v)?.op == OrderCode.NEXT_PAGE) {
-                SyncRepository.message.value = "page set changed on tablet — sync again before deleting"
+                SyncRepository.notify("page set changed on tablet — sync again before deleting")
                 return
             }
         }
@@ -151,7 +151,7 @@ class SyncService : Service() {
             teardown(SyncState.Error("connection lost"))
             return
         }
-        SyncRepository.message.value = "deleted $ok/${indices.size} page(s) on tablet"
+        SyncRepository.notify("deleted $ok/${indices.size} page(s) on tablet")
     }
 
     private suspend fun teardown(finalState: SyncState) {

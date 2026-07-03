@@ -67,13 +67,13 @@ private fun App() {
     val message by SyncRepository.message.collectAsState()
 
     LaunchedEffect(message) {
-        message?.let { snackbar.showSnackbar(it); SyncRepository.message.value = null }
+        message?.let { snackbar.showSnackbar(it.second); SyncRepository.message.value = null }
     }
 
     val permLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()) { grants ->
         if (grants.values.all { it }) SyncService.sync(context)
-        else SyncRepository.message.value = "Bluetooth permissions are required to sync"
+        else SyncRepository.notify("Bluetooth permissions are required to sync")
     }
 
     Scaffold(snackbarHost = { SnackbarHost(snackbar) }) { pad ->
@@ -149,7 +149,7 @@ private fun GalleryScreen(
                             .filter { it.complete }.map { it.sourceIndex }
                         selected = setOf()
                         if (indices.isNotEmpty()) SyncService.deleteOnTablet(context, indices)
-                        else SyncRepository.message.value = "selected pages are incomplete — not deleting on tablet"
+                        else SyncRepository.notify("selected pages are incomplete — not deleting on tablet")
                     },
                 ) { Text("Delete on tablet") }
                 Spacer(Modifier.width(8.dp))
@@ -211,7 +211,9 @@ private fun ViewerScreen(store: PageStore, stem: String, onBack: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val settings = remember { AppSettings(context) }
-    val page = store.get(stem) ?: run { onBack(); return }
+    val syncState by SyncRepository.state.collectAsState()
+    val version by SyncRepository.pagesVersion.collectAsState()
+    val page = remember(stem, version) { store.get(stem) } ?: run { onBack(); return }
     val bmp = remember(stem) { BitmapFactory.decodeFile(page.pngFile.absolutePath) }
 
     Column(Modifier.fillMaxSize().padding(12.dp)) {
@@ -231,7 +233,7 @@ private fun ViewerScreen(store: PageStore, stem: String, onBack: () -> Unit) {
             Spacer(Modifier.width(8.dp))
             OutlinedButton(
                 // spec: incomplete pages are excluded from tablet-delete
-                enabled = SyncRepository.canDeleteOnTablet() && page.complete,
+                enabled = syncState is SyncState.Connected && page.complete,
                 onClick = { SyncService.deleteOnTablet(context, listOf(page.sourceIndex)) },
             ) { Text("Delete on tablet") }
             Spacer(Modifier.width(8.dp))
@@ -273,7 +275,7 @@ private fun SettingsScreen(onBack: () -> Unit) {
             settings.headerValue = headerValue
             settings.pin = pin.trim()
             settings.deleteAfterUpload = deleteAfterUpload
-            SyncRepository.message.value = "settings saved"
+            SyncRepository.notify("settings saved")
             onBack()
         }) { Text("Save") }
     }
@@ -288,7 +290,7 @@ private suspend fun uploadPages(
     settings: AppSettings,
 ) {
     if (settings.serverUrl.isEmpty()) {
-        SyncRepository.message.value = "set the server URL in Settings first"
+        SyncRepository.notify("set the server URL in Settings first")
         return
     }
     val uploader = Uploader()
@@ -309,7 +311,7 @@ private suspend fun uploadPages(
         }
     }
     SyncRepository.bumpPages()
-    SyncRepository.message.value = "uploaded $ok/${stems.size} page(s)"
+    SyncRepository.notify("uploaded $ok/${stems.size} page(s)")
     if (settings.deleteAfterUpload && uploadedIndices.isNotEmpty() && SyncRepository.canDeleteOnTablet()) {
         SyncService.deleteOnTablet(context, uploadedIndices)
     }
