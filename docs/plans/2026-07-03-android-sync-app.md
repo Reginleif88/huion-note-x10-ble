@@ -72,19 +72,15 @@ android/
 **Interfaces:**
 - Produces: a building `:app` module every later task compiles against; unit tests run with `./gradlew :app:testDebugUnitTest`.
 
-- [ ] **Step 1: Install the toolchain (skip anything already present)**
+- [ ] **Step 1: Toolchain (NixOS)**
 
-On this machine (CachyOS/Arch):
+This machine is NixOS. The environment is `android/shell.nix` (already committed; JDK 17 + Gradle + Android SDK 35 via `androidenv.composeAndroidPackages`, with the aapt2-from-Maven override NixOS requires). **Every `./gradlew` command in this plan runs inside it:**
 
 ```bash
-sudo pacman -S --needed jdk17-openjdk gradle
-# Android SDK via cmdline-tools (AUR) — or reuse an existing Android Studio SDK
-yay -S --needed android-sdk-cmdline-tools-latest android-platform
-yes | sdkmanager --licenses
-sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+nix-shell android/shell.nix --run 'cd android && ./gradlew <task>'
 ```
 
-Then export (add to shell profile): `export ANDROID_HOME=/opt/android-sdk` (or `$HOME/Android/Sdk` if Studio-managed). Verify: `sdkmanager --list_installed` shows `platforms;android-35`.
+Verify the env once: `nix-shell android/shell.nix --run 'java -version && gradle --version && sdkmanager --list_installed'` — expect JDK 17, Gradle 8.x, and `platforms;android-35`. If nixpkgs on this channel lacks build-tools 35.0.0, drop `platformVersions`/`buildToolsVersions`/`compileSdk` to 34 consistently (shell.nix + `app/build.gradle.kts` + the GRADLE_OPTS path).
 
 - [ ] **Step 2: Write the Gradle scaffold**
 
@@ -240,7 +236,7 @@ class SyncService : Service() {
 - [ ] **Step 3: Generate the wrapper and build**
 
 ```bash
-cd android && gradle wrapper --gradle-version 8.9 && ./gradlew :app:assembleDebug
+nix-shell android/shell.nix --run 'cd android && gradle wrapper --gradle-version 8.9 && ./gradlew :app:assembleDebug'
 ```
 
 Expected: `BUILD SUCCESSFUL`; APK at `android/app/build/outputs/apk/debug/app-debug.apk`.
