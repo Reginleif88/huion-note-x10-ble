@@ -19,6 +19,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import xyz.reginleif.hinotesync.ble.GattTransport
 import xyz.reginleif.hinotesync.ble.findTablet
 import xyz.reginleif.hinotesync.protocol.AuthFailed
@@ -39,12 +40,19 @@ class SyncService : Service() {
     private var transport: Transport? = null
     private var engine: SyncEngine? = null
     private var idleJob: Job? = null
+    private var syncJob: Job? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_SYNC -> scope.launch { runSync() }
+            ACTION_SYNC -> {
+                if (syncJob?.isActive == true) {
+                    SyncRepository.message.value = "sync already running"
+                } else {
+                    syncJob = scope.launch { runSync() }
+                }
+            }
             ACTION_DELETE -> {
                 val indices = intent.getIntArrayExtra(EXTRA_INDICES) ?: intArrayOf()
                 scope.launch { runDelete(indices.toList()) }
@@ -108,6 +116,8 @@ class SyncService : Service() {
             teardown(SyncState.Error("connection lost: ${e.message}"))
         } catch (e: FrameTimeout) {
             teardown(SyncState.Error("device stopped responding"))
+        } catch (e: Exception) {
+            teardown(SyncState.Error("sync failed: ${e.message}"))
         }
     }
 
@@ -120,8 +130,11 @@ class SyncService : Service() {
         }
         scheduleIdleDisconnect() // reset the idle timer
         // Guardrail: refuse if the tablet created pages since the sync (NEXT_PAGE seen).
-        while (true) {
-            val v = try { t.recv(1_000) } catch (ex: FrameTimeout) { break } catch (ex: TransportClosed) {
+        // Bounded by a wall-clock deadline rather than a full second of silence, so
+        // sub-second device chatter can't make this drain hang forever.
+        val deadline = System.currentTimeMillis() + 1_500
+        while (System.currentTimeMillis() < deadline) {
+            val v = try { t.recv(250) } catch (ex: FrameTimeout) { continue } catch (ex: TransportClosed) {
                 teardown(SyncState.Error("connection lost")); return
             }
             if (parseHuionFrame(v)?.op == OrderCode.NEXT_PAGE) {
@@ -130,8 +143,13 @@ class SyncService : Service() {
             }
         }
         var ok = 0
-        for (idx in indices.sortedDescending()) {           // descending: indices can't shift
-            if (e.deletePage(idx)) ok += 1
+        try {
+            for (idx in indices.sortedDescending()) {       // descending: indices can't shift
+                if (e.deletePage(idx)) ok += 1
+            }
+        } catch (ex: TransportClosed) {
+            teardown(SyncState.Error("connection lost"))
+            return
         }
         SyncRepository.message.value = "deleted $ok/${indices.size} page(s) on tablet"
     }
@@ -177,6 +195,18 @@ class SyncService : Service() {
 
     override fun onDestroy() {
         scope.cancel()
+        // scope.cancel() only requests cancellation of any in-flight coroutine; it doesn't
+        // synchronously close the transport or reset process-lifetime state. Do that here so
+        // a mid-sync teardown of the service can't leak the GATT connection or leave
+        // SyncRepository.state stuck on Scanning/Connecting/Syncing forever.
+        runBlocking { try { transport?.close() } catch (e: Exception) { /* already gone */ } }
+        transport = null
+        engine = null
+        when (SyncRepository.state.value) {
+            is SyncState.Scanning, is SyncState.Connecting, is SyncState.Syncing ->
+                SyncRepository.state.value = SyncState.Idle
+            else -> {}
+        }
         super.onDestroy()
     }
 
