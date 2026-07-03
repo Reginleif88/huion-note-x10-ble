@@ -37,6 +37,8 @@ class GattTransport(private val context: Context, private val device: BluetoothD
     private var cmdChar: BluetoothGattCharacteristic? = null
     // Completed from onCharacteristicWrite with the GATT status of the in-flight write.
     // Guarded by writeMutex: only one write is ever outstanding at a time.
+    // @Volatile: written on the caller's dispatcher, read on the Binder callback thread.
+    @Volatile
     private var pendingWrite: CompletableDeferred<Int>? = null
 
     private val callback = object : BluetoothGattCallback() {
