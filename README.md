@@ -10,8 +10,8 @@ Linux driver deliberately disables BLE, so the protocol was reverse-engineered f
 the macOS/Windows drivers (Ghidra), Android BLE captures + APK. The repo gives you two
 tools that share that work:
 
-- 🖊️ **Tablet driver** — live pen input (pressure + tilt) for Linux.
-- 📓 **Pages extractor** — pull the pages you wrote *offline* on the notebook and decode
+- **Tablet driver** — live pen input (pressure + tilt) for Linux.
+- **Pages extractor** — pull the pages you wrote *offline* on the notebook and decode
   them to SVG + PNG + JSON, locally.
 
 Both talk to the device over BLE and both need a small [BlueZ patch](#requirements-patch-bluez)
