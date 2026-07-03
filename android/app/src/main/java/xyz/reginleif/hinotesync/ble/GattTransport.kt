@@ -44,6 +44,7 @@ class GattTransport(private val context: Context, private val device: BluetoothD
                     ready.completeExceptionally(TransportClosed("disconnected (status=$status)"))
                     inbox.close()
                     g.close()
+                    gatt = null
                 }
             }
         }
@@ -55,6 +56,10 @@ class GattTransport(private val context: Context, private val device: BluetoothD
 
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
             Log.d(TAG, "mtu=$mtu status=$status")
+            if (status != BluetoothGatt.GATT_SUCCESS || mtu < 129) {
+                ready.completeExceptionally(TransportClosed("MTU negotiation failed (mtu=$mtu status=$status)"))
+                return
+            }
             val svc = g.getService(SERVICE_UUID)
             val data = svc?.getCharacteristic(DATA_CHAR_UUID)
             val cmd = svc?.getCharacteristic(CMD_CHAR_UUID)
@@ -70,6 +75,10 @@ class GattTransport(private val context: Context, private val device: BluetoothD
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                ready.completeExceptionally(TransportClosed("CCCD write failed on ${d.characteristic.uuid} (status=$status)"))
+                return
+            }
             if (d.characteristic.uuid == DATA_CHAR_UUID) {
                 writeCccd(g, g.getService(SERVICE_UUID).getCharacteristic(CMD_CHAR_UUID),
                     BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
@@ -104,8 +113,15 @@ class GattTransport(private val context: Context, private val device: BluetoothD
     }
 
     override suspend fun connect() {
-        gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
-        withTimeoutOrNull(20_000) { ready.await() } ?: throw TransportClosed("setup timed out")
+        val g = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
+        gatt = g
+        try {
+            withTimeoutOrNull(20_000) { ready.await() } ?: throw TransportClosed("setup timed out")
+        } catch (e: Throwable) {
+            g.close()
+            gatt = null
+            throw e
+        }
     }
 
     override suspend fun send(frame: ByteArray) {
