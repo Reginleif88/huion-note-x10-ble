@@ -17,16 +17,19 @@ class Uploader(private val client: OkHttpClient = OkHttpClient()) {
         png: ByteArray,
         strokesJson: String,
     ): Boolean {
-        val body = MultipartBody.Builder().setType(MultipartBody.FORM)
-            .addFormDataPart("page", "$stem.png", png.toRequestBody("image/png".toMediaType()))
-            .addFormDataPart("strokes", "$stem.json", strokesJson.toRequestBody("application/json".toMediaType()))
-            .build()
-        val request = Request.Builder().url(url).post(body).apply {
-            if (!headerName.isNullOrBlank() && !headerValue.isNullOrEmpty()) header(headerName, headerValue)
-        }.build()
         return try {
+            val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                .addFormDataPart("page", "$stem.png", png.toRequestBody("image/png".toMediaType()))
+                .addFormDataPart("strokes", "$stem.json", strokesJson.toRequestBody("application/json".toMediaType()))
+                .build()
+            val request = Request.Builder().url(url).post(body).apply {
+                if (!headerName.isNullOrBlank() && !headerValue.isNullOrEmpty()) header(headerName, headerValue)
+            }.build()
             client.newCall(request).execute().use { it.isSuccessful }
         } catch (e: IOException) {
+            false
+        } catch (e: IllegalArgumentException) {
+            // Malformed URL or header name/value rejected by OkHttp's builders.
             false
         }
     }

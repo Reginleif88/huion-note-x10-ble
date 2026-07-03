@@ -40,4 +40,10 @@ class UploaderTest {
         // nothing listens on this port
         assertFalse(Uploader().upload("http://127.0.0.1:1/", null, null, "s", byteArrayOf(1), "{}"))
     }
+
+    @Test fun malformedUrlReturnsFalseNotThrow() {
+        // OkHttp's Request.Builder.url() throws IllegalArgumentException on a bad URL;
+        // Uploader must swallow it and report failure rather than crashing the caller.
+        assertFalse(Uploader().upload("not a url", null, null, "s", byteArrayOf(1), "{}"))
+    }
 }
