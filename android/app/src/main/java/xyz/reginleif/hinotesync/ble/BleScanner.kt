@@ -13,13 +13,21 @@ import kotlin.coroutines.resume
 
 private const val TAG = "BleScanner"
 
-/** Find the tablet: direct by remembered MAC when possible, else scan for a name
- *  containing "huion". Requires BLUETOOTH_SCAN/CONNECT (UI gates this). */
+/** Find the tablet, in order of reliability:
+ *   1. the remembered MAC from a previous sync,
+ *   2. a BONDED device named like a Huion — a paired tablet stops advertising, so a
+ *      scan can never see it; this is the common case once the tablet is paired,
+ *   3. an advertising device whose name contains "huion" (never-paired tablet).
+ *  Requires BLUETOOTH_SCAN/CONNECT (UI gates this). */
 @SuppressLint("MissingPermission")
 suspend fun findTablet(context: Context, lastMac: String, timeoutMs: Long = 15_000): BluetoothDevice? {
     val adapter = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter ?: return null
     if (lastMac.isNotEmpty()) {
-        try { return adapter.getRemoteDevice(lastMac) } catch (e: IllegalArgumentException) { /* fall through to scan */ }
+        try { return adapter.getRemoteDevice(lastMac) } catch (e: IllegalArgumentException) { /* fall through */ }
+    }
+    adapter.bondedDevices?.firstOrNull { (it.name ?: "").contains("huion", ignoreCase = true) }?.let {
+        Log.d(TAG, "using bonded device: ${it.name} ${it.address}")
+        return it
     }
     val scanner = adapter.bluetoothLeScanner ?: return null
     return withTimeoutOrNull(timeoutMs) {
