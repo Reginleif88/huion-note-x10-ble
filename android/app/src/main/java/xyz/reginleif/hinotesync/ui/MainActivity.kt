@@ -109,6 +109,7 @@ private fun GalleryScreen(
 ) {
     val context = LocalContext.current
     val state by SyncRepository.state.collectAsState()
+    val battery by SyncRepository.battery.collectAsState()
     val version by SyncRepository.pagesVersion.collectAsState()
     val pages = remember(version) { store.list() }
     var selected by remember { mutableStateOf(setOf<String>()) }
@@ -121,15 +122,17 @@ private fun GalleryScreen(
             Spacer(Modifier.weight(1f))
             TextButton(onClick = onSettings) { Text("Settings") }
         }
+        val statusText = when (val s = state) {
+            is SyncState.Idle -> "disconnected"
+            is SyncState.Scanning -> "scanning for tablet…"
+            is SyncState.Connecting -> "connecting…"
+            is SyncState.Syncing -> "syncing… ${s.pagesDone} page(s)"
+            is SyncState.Connected -> "connected — tablet deletes available"
+            is SyncState.Error -> "error: ${s.message}"
+        }
         Text(
-            when (val s = state) {
-                is SyncState.Idle -> "disconnected"
-                is SyncState.Scanning -> "scanning for tablet…"
-                is SyncState.Connecting -> "connecting…"
-                is SyncState.Syncing -> "syncing… ${s.pagesDone} page(s)"
-                is SyncState.Connected -> "connected — tablet deletes available"
-                is SyncState.Error -> "error: ${s.message}"
-            },
+            // battery is non-null only while connected, so show it as a suffix when present
+            statusText + (battery?.let { " · 🔋 $it%" } ?: ""),
             style = MaterialTheme.typography.bodyMedium,
         )
         Spacer(Modifier.height(8.dp))

@@ -10,12 +10,16 @@ class SyncEngine(
 ) {
     var limits: Limits = Limits()
         private set
+    /** Tablet battery %, read once during the handshake; null if the device didn't answer. */
+    var battery: Int? = null
+        private set
 
     suspend fun run(onPage: suspend (PageData) -> Unit): Int {
         t.connect()
         authenticate()
         t.send(requestMaxInfo())
         limits = parseMaxData(recvOp(OrderCode.MAX_DATA).raw)
+        battery = queryBattery()
         // Ask the device its logic-page count (CURRENT_PAGE 0x85). Some firmware holds an
         // empty page 0 with content in later pages, so we must iterate up to this count and
         // SKIP empty pages rather than stop at the first one. Fall back to a bounded scan if
@@ -33,6 +37,19 @@ class SyncEngine(
             pages++
         }
         return pages
+    }
+
+    /** Battery % from ELECTRICITY (0x8e), reply byte [3]; null if the device doesn't answer. */
+    private suspend fun queryBattery(): Int? {
+        t.send(buildCommand(OrderCode.ELECTRICITY))
+        return try {
+            val r = recvOp(OrderCode.ELECTRICITY, timeoutMs = 2_000).raw
+            if (r.size >= 4) u8(r[3]) else null
+        } catch (e: FrameTimeout) {
+            null
+        } catch (e: TransportClosed) {
+            null
+        }
     }
 
     /** Logic-page count from CURRENT_PAGE (0x85); 0 if the device doesn't answer. */

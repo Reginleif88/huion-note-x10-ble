@@ -32,6 +32,7 @@ private fun device(
         OrderCode.VERIFY_PWD ->
             if (u8(f.raw[3]) == 2) listOf("cd82050100".unhex()) else emptyList() // ok after 2nd PIN frame
         OrderCode.MAX_DATA -> listOf("cd950b286e00189200ff1f".unhex())
+        OrderCode.ELECTRICITY -> listOf("cd8e055700".unhex())   // battery 0x57 = 87%
         OrderCode.CURRENT_PAGE -> {
             // Report a logic-page count one past the highest page index we hold.
             val count = (pages.keys.maxOrNull()?.plus(1)) ?: 0
@@ -56,9 +57,11 @@ class SyncEngineTest {
             1 to listOf(packet(0x87, 1, listOf(DOWN, DOWN2))),
         )))
         val got = mutableListOf<PageData>()
-        val n = SyncEngine(t).run { got.add(it) }
+        val engine = SyncEngine(t)
+        val n = engine.run { got.add(it) }
         assertEquals(2, n)
         assertEquals(28200f, got[0].limits.maxX)   // limits came from the 0x95 reply
+        assertEquals(87, engine.battery)           // read from the ELECTRICITY (0x8e) reply
         assertTrue(got.all { it.complete })
         // stream packets carry pen-down runs with no pen-up separator between packets,
         // so page 0's four points merge into one stroke

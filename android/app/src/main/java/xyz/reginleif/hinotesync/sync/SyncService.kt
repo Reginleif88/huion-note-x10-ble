@@ -133,6 +133,7 @@ class SyncService : Service() {
                 attempt()
             }
             lastSyncedAt = syncedAt   // this session's pages are now the only delete-eligible set
+            SyncRepository.battery.value = engine?.battery
             SyncRepository.notify("synced $done page(s)")
 
             if (settings.deleteAfterSync && syncedComplete.isNotEmpty()) {
@@ -239,6 +240,7 @@ class SyncService : Service() {
         try { transport?.close() } catch (e: Exception) { /* already gone */ }
         transport = null
         engine = null
+        SyncRepository.battery.value = null   // disconnected: battery reading no longer valid
         SyncRepository.state.value = finalState
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()

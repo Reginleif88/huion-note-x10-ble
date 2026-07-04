@@ -20,6 +20,7 @@ object OrderCode {
     const val NEXT_PAGE = 0x8A          // device→app "page created" notice
     const val DELETE_PAGE = 0x8B        // destructive
     const val CLEAR_CACHE = 0x8C        // destructive
+    const val ELECTRICITY = 0x8E        // battery %, reply byte [3]
     const val DEVICE_NAME = 0x91
     const val GET_PWD = 0x93
     const val MAX_DATA = 0x95

@@ -24,6 +24,9 @@ object SyncRepository {
     val message = MutableStateFlow<Pair<Long, String>?>(null)
     private var counter = 0L
 
+    /** Tablet battery %, set from the last handshake; null when disconnected/unknown. */
+    val battery = MutableStateFlow<Int?>(null)
+
     fun canDeleteOnTablet(): Boolean = state.value == SyncState.Connected
     fun bumpPages() { pagesVersion.value += 1 }
     fun notify(text: String) { message.value = counter++ to text }
