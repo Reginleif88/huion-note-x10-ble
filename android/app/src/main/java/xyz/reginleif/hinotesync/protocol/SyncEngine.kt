@@ -16,17 +16,36 @@ class SyncEngine(
         authenticate()
         t.send(requestMaxInfo())
         limits = parseMaxData(recvOp(OrderCode.MAX_DATA).raw)
+        // Ask the device its logic-page count (CURRENT_PAGE 0x85). Some firmware holds an
+        // empty page 0 with content in later pages, so we must iterate up to this count and
+        // SKIP empty pages rather than stop at the first one. Fall back to a bounded scan if
+        // the device doesn't answer.
+        val pageCount = currentPageCount()
         val (d1, d2) = requestSetManyPacketDistance()
         t.send(d1)
         t.send(d2)
+        val lastPage = if (pageCount in 1..maxPages) pageCount else maxPages - 1
         var pages = 0
-        for (page in 0 until maxPages) {
+        for (page in 0..lastPage) {
             val (count, packets, complete) = fetchPage(page)
-            if (count == 0) break
+            if (count == 0) continue          // empty page — skip, keep scanning
             onPage(decodePage(packets, limits, page, complete))
             pages++
         }
         return pages
+    }
+
+    /** Logic-page count from CURRENT_PAGE (0x85); 0 if the device doesn't answer. */
+    private suspend fun currentPageCount(): Int {
+        t.send(buildCommand(OrderCode.CURRENT_PAGE))
+        return try {
+            val r = recvOp(OrderCode.CURRENT_PAGE, timeoutMs = 3_000).raw
+            if (r.size >= 5) u8(r[3]) or (u8(r[4]) shl 8) else 0
+        } catch (e: FrameTimeout) {
+            0
+        } catch (e: TransportClosed) {
+            0
+        }
     }
 
     private suspend fun authenticate() {

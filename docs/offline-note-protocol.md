@@ -179,9 +179,20 @@ For each missing `seq i`: `requestReGetPackageData(page, i)` →
 at bytes [3..4]. [`requestReGetPackageData` + case 136]
 
 ### Page iteration
-Loop `page = 0,1,2,…`; advance when a page completes; stop when a page returns
-`count == 0`. (The official app pre-knew the page count; `count == 0` is the safe
-terminator — confirm against the device.)
+Loop `page = 0,1,2,…`; advance when a page completes.
+
+**⚠️ Do NOT stop at the first `count == 0`.** ✅ (hardware-confirmed on a live
+`Huion Note-X10`, fw differing from the `T218_230819` capture): some firmware
+holds an **empty page 0 (and other empty pages) with real content at higher
+indices** — e.g. a device reporting 11 logic pages had pages 0–6 empty and content
+in pages 7–11. Stopping at the first empty page yields **zero pages**.
+
+The robust flow (how the official app "pre-knew" the count): query
+**`CURRENT_PAGE (0x85)`** first — `cd 85 08 00 00 00 00 ed`, reply
+`cd 85 05 <count_lo> <count_hi>` = logic-page count (u16 LE) — then request pages
+`0 … count`, **skipping** empty pages (`count == 0`) instead of stopping. The
+Android client (`SyncEngine`) does this; the Python `session.py` still has the
+old stop-at-first-empty loop and should be updated the same way.
 
 ### Other opcodes
 - `0x8b DELETE_PAGE (139)`: delete one page by index

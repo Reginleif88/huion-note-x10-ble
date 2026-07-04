@@ -32,6 +32,12 @@ private fun device(
         OrderCode.VERIFY_PWD ->
             if (u8(f.raw[3]) == 2) listOf("cd82050100".unhex()) else emptyList() // ok after 2nd PIN frame
         OrderCode.MAX_DATA -> listOf("cd950b286e00189200ff1f".unhex())
+        OrderCode.CURRENT_PAGE -> {
+            // Report a logic-page count one past the highest page index we hold.
+            val count = (pages.keys.maxOrNull()?.plus(1)) ?: 0
+            listOf(byteArrayOf(0xCD.toByte(), 0x85.toByte(), 0x05,
+                (count and 0xFF).toByte(), ((count shr 8) and 0xFF).toByte()))
+        }
         OrderCode.REQUEST_OFFLINE_DATA -> {
             val page = u8(f.raw[3]) or (u8(f.raw[4]) shl 8)
             val pkts = pages[page] ?: emptyList()
@@ -58,6 +64,21 @@ class SyncEngineTest {
         // so page 0's four points merge into one stroke
         assertEquals(1, got[0].strokes.size)
         assertEquals(4, got[0].strokes[0].size)
+    }
+
+    @Test fun scansAllPagesWhenPageZeroIsEmpty() = runTest {
+        // Regression (hardware-found): some firmware reports N logic pages with an EMPTY
+        // page 0 and content only in later pages. The engine must ask CURRENT_PAGE for the
+        // count and scan every page up to it, skipping empties — not stop at the first empty.
+        val t = FakeTransport(device(pages = mapOf(
+            2 to listOf(packet(0x87, 1, listOf(DOWN, DOWN2))),
+            3 to listOf(packet(0x87, 1, listOf(DOWN, DOWN2)), packet(0x87, 2, listOf(DOWN, DOWN2))),
+        )))
+        val got = mutableListOf<PageData>()
+        val n = SyncEngine(t).run { got.add(it) }
+        assertEquals(2, n)                                       // pages 2 and 3, not halted by empty 0/1
+        assertEquals(listOf(2, 3), got.map { it.index })
+        assertTrue(t.sent.any { it.hex() == "cd850800000000ed" })  // CURRENT_PAGE was queried
     }
 
     @Test fun gapIsFilledViaGetPagePackage() = runTest {
