@@ -28,6 +28,7 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import xyz.reginleif.hinotesync.settings.AppSettings
 import xyz.reginleif.hinotesync.store.PageStore
 import xyz.reginleif.hinotesync.store.StoredPage
@@ -253,10 +254,13 @@ private fun SettingsScreen(onBack: () -> Unit) {
     var headerValue by remember { mutableStateOf(settings.headerValue) }
     var pin by remember { mutableStateOf(settings.pin) }
     var deleteAfterUpload by remember { mutableStateOf(settings.deleteAfterUpload) }
+    var urlError by remember { mutableStateOf<String?>(null) }
 
     Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         TextButton(onClick = onBack) { Text("< Back") }
-        OutlinedTextField(url, { url = it }, label = { Text("Server URL (https://…)") },
+        OutlinedTextField(url, { url = it; urlError = null }, label = { Text("Server URL (https://…)") },
+            isError = urlError != null,
+            supportingText = urlError?.let { msg -> { Text(msg) } },
             modifier = Modifier.fillMaxWidth(), singleLine = true)
         OutlinedTextField(headerName, { headerName = it }, label = { Text("Auth header name (optional)") },
             modifier = Modifier.fillMaxWidth(), singleLine = true)
@@ -270,13 +274,21 @@ private fun SettingsScreen(onBack: () -> Unit) {
             Text("Delete page from tablet after successful upload")
         }
         Button(onClick = {
-            settings.serverUrl = url.trim()
-            settings.headerName = headerName.trim()
-            settings.headerValue = headerValue
-            settings.pin = pin.trim()
-            settings.deleteAfterUpload = deleteAfterUpload
-            SyncRepository.notify("settings saved")
-            onBack()
+            val trimmedUrl = url.trim()
+            // Validate with the SAME parser OkHttp's Request.Builder().url() uses, so a URL
+            // that saves here cannot throw at upload time. Empty is allowed (clears config).
+            if (trimmedUrl.isNotEmpty() && trimmedUrl.toHttpUrlOrNull() == null) {
+                urlError = "Enter a valid http:// or https:// URL (include the scheme)"
+            } else {
+                urlError = null
+                settings.serverUrl = trimmedUrl
+                settings.headerName = headerName.trim()
+                settings.headerValue = headerValue
+                settings.pin = pin.trim()
+                settings.deleteAfterUpload = deleteAfterUpload
+                SyncRepository.notify("settings saved")
+                onBack()
+            }
         }) { Text("Save") }
     }
 }
