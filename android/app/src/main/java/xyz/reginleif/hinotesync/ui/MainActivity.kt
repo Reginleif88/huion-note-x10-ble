@@ -149,10 +149,10 @@ private fun GalleryScreen(
                         val stems = selected.mapNotNull { store.get(it) }
                             .filter { it.complete }.map { it.stem }
                         selected = setOf()
-                        if (stems.isNotEmpty()) SyncService.deleteOnTablet(context, stems)
+                        if (stems.isNotEmpty()) SyncService.deleteOnTablet(context, stems, alsoLocal = true)
                         else SyncRepository.notify("selected pages are incomplete — not deleting on tablet")
                     },
-                ) { Text("Delete on tablet") }
+                ) { Text("Delete (tablet + local)") }
                 Spacer(Modifier.width(8.dp))
                 OutlinedButton(onClick = {
                     selected.forEach { store.deleteLocal(it) }; selected = setOf()
@@ -235,8 +235,8 @@ private fun ViewerScreen(store: PageStore, stem: String, onBack: () -> Unit) {
             OutlinedButton(
                 // spec: incomplete pages are excluded from tablet-delete
                 enabled = syncState is SyncState.Connected && page.complete,
-                onClick = { SyncService.deleteOnTablet(context, listOf(page.stem)) },
-            ) { Text("Delete on tablet") }
+                onClick = { SyncService.deleteOnTablet(context, listOf(page.stem), alsoLocal = true); onBack() },
+            ) { Text("Delete (tablet + local)") }
             Spacer(Modifier.width(8.dp))
             OutlinedButton(onClick = { store.deleteLocal(stem); SyncRepository.bumpPages(); onBack() }) {
                 Text("Delete local")

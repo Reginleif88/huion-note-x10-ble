@@ -70,7 +70,8 @@ class SyncService : Service() {
             }
             ACTION_DELETE -> {
                 val stems = intent.getStringArrayExtra(EXTRA_STEMS)?.toList() ?: emptyList()
-                scope.launch { runDelete(stems) }
+                val alsoLocal = intent.getBooleanExtra(EXTRA_ALSO_LOCAL, false)
+                scope.launch { runDelete(stems, alsoLocal) }
             }
             ACTION_DISCONNECT -> {
                 // Cancel the sync coroutine first so its automatic-retry logic can't
@@ -146,7 +147,7 @@ class SyncService : Service() {
         }
     }
 
-    private suspend fun runDelete(stems: List<String>) {
+    private suspend fun runDelete(stems: List<String>, alsoLocal: Boolean) {
         val e = engine
         val t = transport
         if (e == null || t == null || SyncRepository.state.value != SyncState.Connected) {
@@ -158,14 +159,16 @@ class SyncService : Service() {
         // session's sync: an older sync's index may now point at a different tablet page.
         // Drop anything synced before this session, then require completeness, dedup, and
         // delete highest-index-first so surviving indices can't shift under us.
+        // NOTE: resolution reads each stem's meta.json, so a combined "tablet + local" delete
+        // MUST remove the local copy only AFTER this resolution (done post-loop below).
         val store = PageStore(filesDir)
         val resolved = stems.mapNotNull { store.get(it) }
         val stale = resolved.filter { it.syncedAt != lastSyncedAt }
         if (stale.isNotEmpty()) {
             SyncRepository.notify("${stale.size} page(s) skipped: synced before this session")
         }
-        val indices = resolved
-            .filter { it.syncedAt == lastSyncedAt && it.complete }
+        val deletable = resolved.filter { it.syncedAt == lastSyncedAt && it.complete }
+        val indices = deletable
             .map { it.sourceIndex }
             .distinct()
             .sortedDescending()               // descending: indices can't shift
@@ -192,7 +195,17 @@ class SyncService : Service() {
             teardown(SyncState.Error("connection lost"))
             return
         }
-        SyncRepository.notify("deleted $ok/${indices.size} page(s) on tablet")
+        // Combined "tablet + local": now that resolution + tablet delete are done, prune the
+        // local copies of exactly the pages we acted on. Only reached on the success path
+        // (aborts above returned early), so a refused/guarded delete never removes local.
+        if (alsoLocal) {
+            deletable.forEach { store.deleteLocal(it.stem) }
+            SyncRepository.bumpPages()
+        }
+        SyncRepository.notify(
+            if (alsoLocal) "deleted $ok/${indices.size} page(s) on tablet + removed local copies"
+            else "deleted $ok/${indices.size} page(s) on tablet",
+        )
         // After any confirmed delete the tablet's page set has shifted: force a fresh sync
         // before further tablet-deletes so no now-stale sourceIndex stays usable.
         if (ok >= 1) teardown(SyncState.Idle)
@@ -261,13 +274,18 @@ class SyncService : Service() {
         const val ACTION_DELETE = "xyz.reginleif.hinotesync.DELETE"
         const val ACTION_DISCONNECT = "xyz.reginleif.hinotesync.DISCONNECT"
         const val EXTRA_STEMS = "stems"
+        const val EXTRA_ALSO_LOCAL = "alsoLocal"
 
         fun sync(context: Context) = ContextCompat.startForegroundService(
             context, Intent(context, SyncService::class.java).setAction(ACTION_SYNC))
 
-        fun deleteOnTablet(context: Context, stems: List<String>) = context.startService(
-            Intent(context, SyncService::class.java).setAction(ACTION_DELETE)
-                .putExtra(EXTRA_STEMS, stems.toTypedArray()))
+        /** Delete the given pages on the tablet. When [alsoLocal] is true, the local copies
+         *  are pruned too (after the tablet-side resolution), giving one "delete everywhere". */
+        fun deleteOnTablet(context: Context, stems: List<String>, alsoLocal: Boolean = false) =
+            context.startService(
+                Intent(context, SyncService::class.java).setAction(ACTION_DELETE)
+                    .putExtra(EXTRA_STEMS, stems.toTypedArray())
+                    .putExtra(EXTRA_ALSO_LOCAL, alsoLocal))
 
         fun disconnect(context: Context) = context.startService(
             Intent(context, SyncService::class.java).setAction(ACTION_DISCONNECT))
