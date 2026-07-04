@@ -28,6 +28,8 @@ private val DATA_CHAR_UUID = UUID.fromString("0000ffe1-0000-1000-8000-00805f9b34
 private val CMD_CHAR_UUID = UUID.fromString("0000ffe2-0000-1000-8000-00805f9b34fb")   // write + indications (0x002b)
 private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
+private fun UUID.short(): String = toString().substring(4, 8)  // e.g. "ffe1"
+
 @SuppressLint("MissingPermission") // UI gates BLUETOOTH_CONNECT before any transport is built
 class GattTransport(private val context: Context, private val device: BluetoothDevice) : Transport {
     private val inbox = Channel<ByteArray>(Channel.UNLIMITED)
@@ -45,7 +47,10 @@ class GattTransport(private val context: Context, private val device: BluetoothD
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             Log.d(TAG, "connection state=$newState status=$status")
             when {
-                newState == BluetoothProfile.STATE_CONNECTED -> g.discoverServices()
+                // MTU first, THEN service discovery: on a warm reconnect to a bonded device
+                // Android can deliver onMtuChanged before services are (re)discovered, so we
+                // must not look up characteristics until onServicesDiscovered.
+                newState == BluetoothProfile.STATE_CONNECTED -> g.requestMtu(247)
                 newState == BluetoothProfile.STATE_DISCONNECTED -> {
                     ready.completeExceptionally(TransportClosed("disconnected (status=$status)"))
                     inbox.close()
@@ -55,20 +60,23 @@ class GattTransport(private val context: Context, private val device: BluetoothD
             }
         }
 
-        override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
-            // MTU first: 126-byte data values need ATT_MTU >= 129.
-            g.requestMtu(247)
-        }
-
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+            // 126-byte data values need ATT_MTU >= 129; fail fast if the peer won't grant it.
             Log.d(TAG, "mtu=$mtu status=$status")
             if (status != BluetoothGatt.GATT_SUCCESS || mtu < 129) {
                 ready.completeExceptionally(TransportClosed("MTU negotiation failed (mtu=$mtu status=$status)"))
                 return
             }
+            g.discoverServices()
+        }
+
+        override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+            Log.d(TAG, "services discovered status=$status ffe0=${g.getService(SERVICE_UUID) != null} " +
+                "services=${g.services.map { it.uuid.short() }}")
             val svc = g.getService(SERVICE_UUID)
             val data = svc?.getCharacteristic(DATA_CHAR_UUID)
             val cmd = svc?.getCharacteristic(CMD_CHAR_UUID)
+            Log.d(TAG, "chars: ffe1(data)=${data != null} ffe2(cmd)=${cmd != null}")
             if (data == null || cmd == null) {
                 ready.completeExceptionally(TransportClosed("FFE0/FFE1/FFE2 not found"))
                 return
@@ -85,10 +93,12 @@ class GattTransport(private val context: Context, private val device: BluetoothD
                 ready.completeExceptionally(TransportClosed("CCCD write failed on ${d.characteristic.uuid} (status=$status)"))
                 return
             }
+            Log.d(TAG, "cccd written on ${d.characteristic.uuid.short()} status=$status")
             if (d.characteristic.uuid == DATA_CHAR_UUID) {
                 writeCccd(g, g.getService(SERVICE_UUID).getCharacteristic(CMD_CHAR_UUID),
                     BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
             } else {
+                Log.d(TAG, "setup complete — notifications live, ready")
                 ready.complete(Unit)
             }
         }
