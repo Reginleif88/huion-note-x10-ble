@@ -2,7 +2,7 @@
 
 Native Android client for the Huion Note X10 offline-notes protocol
 (see `../docs/offline-note-protocol.md`). Syncs stored pages over BLE,
-renders them locally, uploads PNG + strokes JSON to your own server,
+renders them locally, uploads PNG + SVG to your own server,
 and can delete synced pages from the tablet. No Huion app, no cloud.
 
 ## Build & install
@@ -22,8 +22,10 @@ On NixOS, `shell.nix` in this directory provides the whole toolchain:
    Tablet deletes only work while the session is live (status "connected")
    and refuse to run if new pages appeared since the sync.
 
-Upload format: one multipart POST per page — `page` = `page-<ts>-<n>.png`,
-`strokes` = `page-<ts>-<n>.json` (same JSON schema as the Linux extractor).
+Upload format: one multipart POST per page carrying both artifacts, which
+share a stem so the receiver can pair them — `page` = `page-<ts>-<n>.png`
+(rendered raster) and `svg` = `page-<ts>-<n>.svg` (vector, byte-identical to
+the Linux extractor's `render_svg`).
 Dev receiver for testing: `python3 tools/upload-receiver.py`.
 
 ## Layout

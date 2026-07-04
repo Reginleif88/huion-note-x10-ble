@@ -14,7 +14,7 @@ class UploaderTest {
         server.start()
         val ok = Uploader().upload(
             server.url("/notes").toString(), "X-Api-Key", "sekrit",
-            "page-1000-0", byteArrayOf(0x50, 0x4E, 0x47), """{"page": 0}""",
+            "page-1000-0", byteArrayOf(0x50, 0x4E, 0x47), "<svg/>",
         )
         assertTrue(ok)
         val req = server.takeRequest()
@@ -22,9 +22,11 @@ class UploaderTest {
         assertEquals("sekrit", req.getHeader("X-Api-Key"))
         assertTrue(req.getHeader("Content-Type")!!.startsWith("multipart/form-data"))
         val body = req.body.readUtf8()
+        // PNG and SVG parts share the stem, in the one request (atomic pairing by stem).
         assertTrue(body.contains("filename=\"page-1000-0.png\""))
-        assertTrue(body.contains("filename=\"page-1000-0.json\""))
-        assertTrue(body.contains("name=\"page\"") && body.contains("name=\"strokes\""))
+        assertTrue(body.contains("filename=\"page-1000-0.svg\""))
+        assertTrue(body.contains("name=\"page\"") && body.contains("name=\"svg\""))
+        assertTrue(body.contains("image/svg+xml"))
         server.shutdown()
     }
 

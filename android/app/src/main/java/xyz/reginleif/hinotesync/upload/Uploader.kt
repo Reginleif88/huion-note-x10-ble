@@ -8,19 +8,23 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 
 class Uploader(private val client: OkHttpClient = OkHttpClient()) {
-    /** Multipart POST of one page. True iff the server answered 2xx. */
+    /**
+     * Multipart POST of one page: the PNG raster and the SVG vector as two parts of a
+     * single request, sharing the same stem (`<stem>.png` + `<stem>.svg`) so the server
+     * receives the pair atomically. True iff the server answered 2xx.
+     */
     fun upload(
         url: String,
         headerName: String?,
         headerValue: String?,
         stem: String,
         png: ByteArray,
-        strokesJson: String,
+        svg: String,
     ): Boolean {
         return try {
             val body = MultipartBody.Builder().setType(MultipartBody.FORM)
                 .addFormDataPart("page", "$stem.png", png.toRequestBody("image/png".toMediaType()))
-                .addFormDataPart("strokes", "$stem.json", strokesJson.toRequestBody("application/json".toMediaType()))
+                .addFormDataPart("svg", "$stem.svg", svg.toRequestBody("image/svg+xml".toMediaType()))
                 .build()
             val request = Request.Builder().url(url).post(body).apply {
                 if (!headerName.isNullOrBlank() && !headerValue.isNullOrEmpty()) header(headerName, headerValue)

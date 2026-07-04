@@ -19,8 +19,9 @@ using the reverse-engineered protocol in `docs/offline-note-protocol.md`.
   support and screen-must-stay-on made the PWA unattractive as the daily tool.
 - **Upload target:** user's own server/webhook — a plain multipart HTTP POST,
   shape defined by us.
-- **Upload payload:** `page.png` (rendered raster) + `strokes.json` (raw
-  x/y/pressure point data) per page, both parts in one multipart POST.
+- **Upload payload:** `page.png` (rendered raster) + `page.svg` (vector, a
+  byte-for-byte port of the Linux extractor's `render_svg`) per page, both parts
+  in one multipart POST sharing the stem so the receiver pairs them atomically.
 - **Location:** new `android/` folder at the repo root; Gradle project is
   self-contained there.
 
@@ -57,9 +58,9 @@ Mirrors the Python module boundaries that already proved themselves:
 | `protocol` | `frames.py`, `auth.py`, `codec.py` | **Pure Kotlin, zero Android imports.** `cd…ed` framing, OrderCode constants, challenge-response + PIN encoding, 0x87/0x88 packet → points → strokes → page. JVM-unit-testable. |
 | `ble` | `transport.py` | Thin `BluetoothGatt` wrapper: scan/connect, enable notify (FFE1) + indications (FFE2), expose inbound frames as a `Flow`, suspend `write()`. |
 | `sync` | `session.py` | Orchestration state machine inside a **foreground service**: handshake → (PIN if demanded) → `MAX_DATA` → `SET_MANY_PACKET_DISTANCE` → page loop until count 0 → gap retransmit → emit completed pages. |
-| `store` | — | App-private storage: one folder per synced page containing `strokes.json`, `page.png`, `meta.json` (sync time, source page index, uploaded flag, complete flag). |
+| `store` | — | App-private storage: one folder per synced page containing `page.svg`, `page.png`, `meta.json` (sync time, source page index, uploaded flag, complete flag). |
 | `render` | `render.py` | Strokes → `Bitmap` via `Canvas`. `page_x = x/MAX_X × W`, top-left origin, no axis swap/flip (X10 is not the T910 variant). Simple linear pressure → stroke width. |
-| `upload` | — | OkHttp multipart POST (`page.png`, `strokes.json`) to configured URL with optional custom auth header. Filename stem `page-<syncTimestamp>-<index>`. |
+| `upload` | — | OkHttp multipart POST (`page.png`, `page.svg`) to configured URL with optional custom auth header. Filename stem `page-<syncTimestamp>-<index>` shared by both parts. |
 | `ui` | — | Compose screens (below). |
 
 ## UI

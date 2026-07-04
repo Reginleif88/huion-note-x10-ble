@@ -2,7 +2,7 @@ package xyz.reginleif.hinotesync.store
 
 import org.json.JSONObject
 import xyz.reginleif.hinotesync.protocol.PageData
-import xyz.reginleif.hinotesync.render.pageJson
+import xyz.reginleif.hinotesync.render.pageSvg
 import java.io.File
 
 class StoredPage(
@@ -14,7 +14,7 @@ class StoredPage(
     val complete: Boolean,
 ) {
     val pngFile: File get() = File(dir, "page.png")
-    val jsonFile: File get() = File(dir, "strokes.json")
+    val svgFile: File get() = File(dir, "page.svg")
 }
 
 class PageStore(private val baseDir: File) {
@@ -23,7 +23,7 @@ class PageStore(private val baseDir: File) {
     fun save(page: PageData, png: ByteArray, syncedAt: Long): StoredPage {
         val stem = "page-$syncedAt-${page.index}"
         val dir = File(pagesDir, stem).apply { mkdirs() }
-        File(dir, "strokes.json").writeText(pageJson(page))
+        File(dir, "page.svg").writeText(pageSvg(page))
         File(dir, "page.png").writeBytes(png)
         val meta = JSONObject()
             .put("sourceIndex", page.index)

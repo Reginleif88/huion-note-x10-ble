@@ -303,7 +303,7 @@ private suspend fun uploadPages(
             val p = store.get(stem) ?: continue
             val success = uploader.upload(
                 settings.serverUrl, settings.headerName.ifEmpty { null }, settings.headerValue,
-                stem, p.pngFile.readBytes(), p.jsonFile.readText(),
+                stem, p.pngFile.readBytes(), p.svgFile.readText(),
             )
             if (success) {
                 store.markUploaded(stem)
