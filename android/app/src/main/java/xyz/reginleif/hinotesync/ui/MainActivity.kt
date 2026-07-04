@@ -260,6 +260,7 @@ private fun SettingsScreen(onBack: () -> Unit) {
     var headerValue by remember { mutableStateOf(settings.headerValue) }
     var pin by remember { mutableStateOf(settings.pin) }
     var deleteAfterUpload by remember { mutableStateOf(settings.deleteAfterUpload) }
+    var deleteAfterSync by remember { mutableStateOf(settings.deleteAfterSync) }
     var urlError by remember { mutableStateOf<String?>(null) }
 
     Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -274,6 +275,11 @@ private fun SettingsScreen(onBack: () -> Unit) {
             modifier = Modifier.fillMaxWidth(), singleLine = true)
         OutlinedTextField(pin, { pin = it }, label = { Text("Device PIN (only if the tablet asks)") },
             modifier = Modifier.fillMaxWidth(), singleLine = true)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Switch(deleteAfterSync, { deleteAfterSync = it })
+            Spacer(Modifier.width(8.dp))
+            Text("Delete pages from tablet after sync (frees tablet memory)")
+        }
         Row(verticalAlignment = Alignment.CenterVertically) {
             Switch(deleteAfterUpload, { deleteAfterUpload = it })
             Spacer(Modifier.width(8.dp))
@@ -292,6 +298,7 @@ private fun SettingsScreen(onBack: () -> Unit) {
                 settings.headerValue = headerValue
                 settings.pin = pin.trim()
                 settings.deleteAfterUpload = deleteAfterUpload
+                settings.deleteAfterSync = deleteAfterSync
                 SyncRepository.notify("settings saved")
                 onBack()
             }

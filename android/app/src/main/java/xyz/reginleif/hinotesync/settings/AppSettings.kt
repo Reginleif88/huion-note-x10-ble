@@ -23,4 +23,7 @@ class AppSettings(context: Context) {
     var deleteAfterUpload: Boolean
         get() = prefs.getBoolean("deleteAfterUpload", false)   // spec: default OFF
         set(v) = prefs.edit().putBoolean("deleteAfterUpload", v).apply()
+    var deleteAfterSync: Boolean
+        get() = prefs.getBoolean("deleteAfterSync", false)      // destructive: default OFF
+        set(v) = prefs.edit().putBoolean("deleteAfterSync", v).apply()
 }

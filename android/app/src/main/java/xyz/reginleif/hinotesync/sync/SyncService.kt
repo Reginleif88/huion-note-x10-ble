@@ -96,6 +96,10 @@ class SyncService : Service() {
             // Reused across the retry below: same stems overwrite instead of duplicating.
             val syncedAt = System.currentTimeMillis()
             var done = 0
+            // Tablet indices of the COMPLETE pages we extracted this session — the only pages
+            // eligible for auto-delete (never delete an incomplete page: the tablet holds its
+            // only full copy).
+            val syncedComplete = mutableSetOf<Int>()
 
             suspend fun attempt() {
                 SyncRepository.state.value = SyncState.Connecting
@@ -109,6 +113,7 @@ class SyncService : Service() {
                     }.toByteArray()
                     store.save(page, png, syncedAt)
                     done += 1
+                    if (page.complete) syncedComplete.add(page.index)
                     SyncRepository.state.value = SyncState.Syncing(done)
                     SyncRepository.bumpPages()
                     if (!page.complete) SyncRepository.notify(
@@ -124,12 +129,30 @@ class SyncService : Service() {
                 SyncRepository.notify("connection dropped — reconnecting…")
                 try { transport?.close() } catch (ex: Exception) { /* already gone */ }
                 done = 0
+                syncedComplete.clear()
                 attempt()
             }
             lastSyncedAt = syncedAt   // this session's pages are now the only delete-eligible set
-            SyncRepository.state.value = SyncState.Connected
             SyncRepository.notify("synced $done page(s)")
-            scheduleIdleDisconnect()
+
+            if (settings.deleteAfterSync && syncedComplete.isNotEmpty()) {
+                // Free tablet memory: delete exactly the complete pages we just extracted,
+                // highest index first so surviving indices can't shift. The pages are already
+                // saved on the phone; a delete failure here never loses data.
+                val e = engine
+                var deleted = 0
+                if (e != null) {
+                    try {
+                        for (idx in syncedComplete.sortedDescending()) if (e.deletePage(idx)) deleted++
+                    } catch (ex: TransportClosed) { /* link dropped during cleanup; pages are stored */ }
+                }
+                SyncRepository.notify("auto-deleted $deleted/${syncedComplete.size} page(s) from tablet")
+                // The tablet's page set has changed; end the session so no now-stale index is reused.
+                teardown(SyncState.Idle)
+            } else {
+                SyncRepository.state.value = SyncState.Connected
+                scheduleIdleDisconnect()
+            }
         } catch (e: PinRequired) {
             teardown(SyncState.Error("device requires a PIN — set it in Settings"))
         } catch (e: AuthFailed) {
