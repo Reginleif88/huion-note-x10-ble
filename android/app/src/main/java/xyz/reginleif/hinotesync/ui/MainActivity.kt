@@ -53,6 +53,12 @@ private fun neededPermissions(): Array<String> = when {
     else -> arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
 }
 
+/** The tablet's offline protocol carries no per-note authoring date, so the only date we
+ *  have is when the page was pulled (syncedAt). Pages from one sync share this timestamp. */
+private fun fmtSynced(epochMs: Long): String =
+    java.text.SimpleDateFormat("MMM d, HH:mm", java.util.Locale.getDefault())
+        .format(java.util.Date(epochMs))
+
 private sealed class Screen {
     data object Gallery : Screen()
     data class Viewer(val stem: String) : Screen()
@@ -197,7 +203,7 @@ private fun PageThumb(page: StoredPage, selected: Boolean, onClick: () -> Unit, 
             }
             Text(
                 buildString {
-                    append("#${page.sourceIndex}")
+                    append(fmtSynced(page.syncedAt))
                     if (page.uploaded) append(" ↑")
                     if (!page.complete) append(" ⚠")
                 },
@@ -221,7 +227,7 @@ private fun ViewerScreen(store: PageStore, stem: String, onBack: () -> Unit) {
         Row {
             TextButton(onClick = onBack) { Text("< Back") }
             Spacer(Modifier.weight(1f))
-            Text("page #${page.sourceIndex}" + if (page.uploaded) " (uploaded)" else "")
+            Text(fmtSynced(page.syncedAt) + if (page.uploaded) " (uploaded)" else "")
         }
         bmp?.let {
             Image(it.asImageBitmap(), contentDescription = null,
