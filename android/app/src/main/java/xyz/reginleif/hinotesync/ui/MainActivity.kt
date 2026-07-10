@@ -4,6 +4,7 @@ import android.Manifest
 import android.graphics.BitmapFactory
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -36,6 +37,7 @@ import xyz.reginleif.hinotesync.sync.SyncRepository
 import xyz.reginleif.hinotesync.sync.SyncService
 import xyz.reginleif.hinotesync.sync.SyncState
 import xyz.reginleif.hinotesync.upload.Uploader
+import xyz.reginleif.hinotesync.upload.UploadResult
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -309,8 +311,13 @@ private fun SettingsScreen(onBack: () -> Unit) {
     }
 }
 
+private const val UPLOAD_TAG = "HiNoteUpload"
+
 /** Uploads pages sequentially off the main thread; marks uploaded; optionally
- *  requests tablet-delete afterwards (only when enabled AND still connected). */
+ *  requests tablet-delete afterwards (only when enabled AND still connected).
+ *  Every step logs to logcat (tag [UPLOAD_TAG]) and the last failure reason is
+ *  surfaced in the result snackbar, so a "0 uploaded" outcome is diagnosable
+ *  without guessing (adb logcat -s HiNoteUpload). */
 private suspend fun uploadPages(
     context: android.content.Context,
     store: PageStore,
@@ -326,22 +333,58 @@ private suspend fun uploadPages(
     // Only complete pages are eligible for tablet-delete: deleting an incomplete page
     // would destroy the tablet's only full copy (spec: incomplete-page exclusion).
     val deletableStems = mutableListOf<String>()
+    // The most recent per-page failure reason, echoed into the summary snackbar.
+    var lastFailure: String? = null
+    Log.d(UPLOAD_TAG, "uploading ${stems.size} page(s) -> ${settings.serverUrl}" +
+        (settings.headerName.ifEmpty { null }?.let { " (auth header '$it')" } ?: " (no auth header)"))
     withContext(Dispatchers.IO) {
         for (stem in stems) {
-            val p = store.get(stem) ?: continue
-            val success = uploader.upload(
+            val p = store.get(stem)
+            if (p == null) {
+                Log.w(UPLOAD_TAG, "skip $stem: no stored page found")
+                lastFailure = "no stored page for $stem"
+                continue
+            }
+            val png = try {
+                p.pngFile.readBytes()
+            } catch (e: Exception) {
+                Log.e(UPLOAD_TAG, "skip $stem: cannot read ${p.pngFile}", e)
+                lastFailure = "cannot read image for $stem"
+                continue
+            }
+            val svg = try {
+                p.svgFile.readText()
+            } catch (e: Exception) {
+                Log.e(UPLOAD_TAG, "skip $stem: cannot read ${p.svgFile}", e)
+                lastFailure = "cannot read svg for $stem"
+                continue
+            }
+            Log.d(UPLOAD_TAG, "POST $stem (png=${png.size}B, svg=${svg.length} chars)")
+            when (val r = uploader.upload(
                 settings.serverUrl, settings.headerName.ifEmpty { null }, settings.headerValue,
-                stem, p.pngFile.readBytes(), p.svgFile.readText(),
-            )
-            if (success) {
-                store.markUploaded(stem)
-                ok += 1
-                if (p.complete) deletableStems += stem
+                stem, png, svg,
+            )) {
+                is UploadResult.Success -> {
+                    Log.d(UPLOAD_TAG, "OK $stem")
+                    store.markUploaded(stem)
+                    ok += 1
+                    if (p.complete) deletableStems += stem
+                }
+                is UploadResult.HttpError -> {
+                    Log.w(UPLOAD_TAG, "FAIL $stem: HTTP ${r.code} ${r.message} — body: ${r.bodySnippet}")
+                    lastFailure = "server said HTTP ${r.code} ${r.message}"
+                }
+                is UploadResult.Failed -> {
+                    Log.w(UPLOAD_TAG, "FAIL $stem: ${r.reason}")
+                    lastFailure = r.reason
+                }
             }
         }
     }
     SyncRepository.bumpPages()
-    SyncRepository.notify("uploaded $ok/${stems.size} page(s)")
+    val summary = "uploaded $ok/${stems.size} page(s)" + (lastFailure?.let { " — $it" }.orEmpty())
+    Log.d(UPLOAD_TAG, summary)
+    SyncRepository.notify(summary)
     if (settings.deleteAfterUpload && deletableStems.isNotEmpty() && SyncRepository.canDeleteOnTablet()) {
         SyncService.deleteOnTablet(context, deletableStems)
     }
